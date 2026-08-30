@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Live Telemanom — Streaming Anomaly Detection</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0e1117;
+    --panel: #161b22;
+    --grid: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --actual: #58a6ff;
+    --pred: #3fb950;
+    --error: #d29922;
+    --anomaly: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  header { padding: 14px 22px; border-bottom: 1px solid var(--grid); display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  header .status { font-size: 12px; color: var(--muted); }
+  header .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #21262d; font-size: 11px; color: var(--muted); }
+  .pill.live { background: #1f6f3a; color: #3fb950; }
+  main { padding: 16px 22px; display: grid; gap: 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--grid); border-radius: 8px; padding: 12px 14px; }
+  .panel h2 { margin: 0 0 8px 0; font-size: 13px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+  canvas { display: block; width: 100%; height: 180px; }
+  .legend { display: flex; gap: 18px; font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+  .controls a, .controls button { background: #21262d; color: var(--text); border: 1px solid var(--grid); border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; text-decoration: none; }
+  .controls a:hover, .controls button:hover { background: #30363d; }
+  .controls .spike { border-color: var(--anomaly); }
+  footer { padding: 8px 22px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--grid); }
+  #alertLog { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; max-height: 140px; overflow-y: auto; }
+  #alertLog .row { color: var(--anomaly); }
+  #alertLog .row .t { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Live Telemanom</h1>
+  <span id="connStatus" class="pill">connecting…</span>
+  <span class="status" id="tickInfo">ticks: 0 · alerts: 0</span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Telemetry — actual (blue) vs LSTM prediction (green)</h2>
+    <canvas id="signal"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>EWMA prediction error (orange) · anomalies (red dots)</h2>
+    <canvas id="error"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>Trigger anomaly (your phone is the satellite)</h2>
+    <div class="controls">
+      <a class="spike" href="/inject?type=spike&magnitude=1">⚡ Spike</a>
+      <a href="/inject?type=shift&magnitude=1">↗ Level shift (+1.0)</a>
+      <a href="/inject?type=shift&magnitude=-1">↘ Level shift (−1.0)</a>
+      <a href="/inject?type=dropout&magnitude=1">⛔ Dropout</a>
+    </div>
+    <p style="font-size:12px;color:var(--muted);margin:10px 0 0 0;">Or hit the URLs directly from your phone: <code>http://&lt;laptop-ip&gt;:8000/inject?type=spike&amp;magnitude=1</code></p>
+  </section>
+
+  <section class="panel">
+    <h2>Recent alerts</h2>
+    <div class="legend">
+      <span><span class="swatch" style="background:var(--actual)"></span>actual</span>
+      <span><span class="swatch" style="background:var(--pred)"></span>prediction</span>
+      <span><span class="swatch" style="background:var(--error)"></span>EWMA error</span>
+      <span><span class="swatch" style="background:var(--anomaly)"></span>anomaly</span>
+    </div>
+    <div id="alertLog"></div>
+  </section>
+</main>
+
+<footer>
+  Telemanom (Hundman et al., 2018) · 2x LSTM(80) + dynamic thresholding · live demo
+</footer>
+
+<script>
+"use strict";
+
+const MAX_POINTS = 800;
+const actualBuf = [];    // {t, v}
+const predBuf = [];      // {t, v}
+const errorBuf = [];     // {t, v}
+const anomalies = [];    // {t, v, score}
+
+let totalTicks = 0;
+let totalAlerts = 0;
+let alertLogEl, connEl, tickEl;
+
+function pushBufs(buf, pt, max) {
+  buf.push(pt);
+  if (buf.length > max) buf.shift();
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${proto}://${location.host}/stream`;
+  const ws = new WebSocket(url);
+  ws.onopen = () => {
+    connEl.textContent = "live";
+    connEl.classList.add("live");
+  };
+  ws.onclose = () => {
+    connEl.textContent = "disconnected — retrying…";
+    connEl.classList.remove("live");
+    setTimeout(connect, 1000);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    totalTicks = Math.max(totalTicks, m.t);
+    pushBufs(actualBuf, {t: m.t, v: m.value}, MAX_POINTS);
+    pushBufs(predBuf, {t: m.t, v: m.pred}, MAX_POINTS);
+    pushBufs(errorBuf, {t: m.t, v: m.error}, MAX_POINTS);
+    if (m.anomaly) {
+      totalAlerts++;
+      const mid = Math.floor((m.anomaly.seq[0] + m.anomaly.seq[1]) / 2);
+      anomalies.push({t: mid, v: m.error, score: m.anomaly.score});
+      if (anomalies.length > 100) anomalies.shift();
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `<span class="t">t=${m.t}</span> · score=${m.anomaly.score.toFixed(2)} · seq=[${m.anomaly.seq[0]}, ${m.anomaly.seq[1]}]`;
+      alertLogEl.insertBefore(row, alertLogEl.firstChild);
+      while (alertLogEl.children.length > 50) alertLogEl.removeChild(alertLogEl.lastChild);
+    }
+    tickEl.textContent = `ticks: ${totalTicks} · alerts: ${totalAlerts}`;
+    draw();
+  };
+}
+
+// -- canvas helpers ------------------------------------------------------
+
+function setupCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = cv.getBoundingClientRect();
+  cv.width = rect.width * dpr;
+  cv.height = rect.height * dpr;
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  return {ctx, w: rect.width, h: rect.height};
+}
+
+function drawSeries(ctx, w, h, series, color, fill = false) {
+  if (series.length < 2) return;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  for (let i = 0; i < series.length; i++) {
+    const x = (i / (MAX_POINTS - 1)) * w;
+    const y = h - (series[i].v * 0.4 + 0.5) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawError(ctx, w, h, series, color) {
+  if (series.length < 2) return;
+  const maxV = Math.max(0.05, ...series.map(p => p.v));
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (let i = 0; i < series.length; i++) {
+    const x = (i / (MAX_POINTS - 1)) * w;
+    const y = h - Math.min(1, series[i].v / maxV) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawAnomalies(ctx, w, h, series, maxV) {
+  ctx.fillStyle = "#f85149";
+  for (const a of series) {
+    // map anomaly tick to x position based on t-window
+    const lastT = actualBuf.length ? actualBuf[actualBuf.length-1].t : 0;
+    const x = ((a.t - (lastT - MAX_POINTS + 1)) / (MAX_POINTS - 1)) * w;
+    if (x < 0 || x > w) continue;
+    const y = h - Math.min(1, a.v / maxV) * h;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function draw() {
+  // signal
+  {
+    const cv = document.getElementById("signal");
+    const {ctx, w, h} = setupCanvas(cv);
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = "#30363d";
+    ctx.beginPath(); ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke();
+    drawSeries(ctx, w, h, actualBuf, "#58a6ff");
+    drawSeries(ctx, w, h, predBuf, "#3fb950");
+  }
+  // error + anomalies
+  {
+    const cv = document.getElementById("error");
+    const {ctx, w, h} = setupCanvas(cv);
+    ctx.clearRect(0, 0, w, h);
+    const maxV = Math.max(0.05, ...errorBuf.map(p => p.v));
+    drawError(ctx, w, h, errorBuf, "#d29922");
+    drawAnomalies(ctx, w, h, anomalies, maxV);
+  }
+}
+
+window.addEventListener("resize", draw);
+
+document.addEventListener("DOMContentLoaded", () => {
+  alertLogEl = document.getElementById("alertLog");
+  connEl = document.getElementById("connStatus");
+  tickEl = document.getElementById("tickInfo");
+  connect();
+});
+</script>
+</body>
+</html>

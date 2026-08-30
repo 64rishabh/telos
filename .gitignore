@@ -1,0 +1,13 @@
+.claude/settings.local.json
+.claude/settings.local.json
+models/*.h5
+models/*.keras
+live/out/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+# telemanom vendored reference — its own data + results are regenerable
+telemanom/data/data/
+telemanom/results/
