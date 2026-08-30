@@ -26,6 +26,7 @@
 11. [Repo conventions](#11-repo-conventions)
 12. [Tooling and dependencies](#12-tooling-and-dependencies)
 13. [Glossary](#13-glossary)
+14. [Incoming: the digital twin branch](#14-incoming-the-digital-twin-branch)
 
 ---
 
@@ -288,7 +289,14 @@ here in the same commit.
 
 ### D-1. Causal knowledge source: hand-authored YAML catalog, not a learned DAG
 
-**Decision:** the cause catalog is a hand-authored YAML file
+> **Status (updated 2026-08-30):** this decision is **partially superseded**
+> by the incoming digital twin. The "YAML catalog" framing is replaced by
+> a single Python module per D-10; the alternatives rejected here (learned
+> DAG, LLM-only RCA) remain rejected. The "hand-authored, not learned"
+> rationale is unchanged — what changed is the *file format*, not the
+> *source-of-truth principle*.
+
+**Decision (original):** the cause catalog is a hand-authored YAML file
 (`mission_ops/knowledge/causes.yaml`) loaded at startup. The Diagnose
 algorithm is a deterministic pattern-matcher that scores cause entries
 against a sliding window of `SymptomEvent`s and returns the top-k
@@ -324,7 +332,12 @@ and the symptom events.
 
 ### D-2. Procedure source: hand-authored procedure catalog, not LLM-drafted
 
-**Decision:** the procedure catalog is a hand-authored YAML file
+> **Status (updated 2026-08-30):** this decision is **partially superseded**
+> by D-10. The "no LLM-drafted procedures" rationale remains valid; what
+> changed is the file format (YAML → single Python module). The LLM is
+> still barred from authoring procedures in any phase.
+
+**Decision (original):** the procedure catalog is a hand-authored YAML file
 (`mission_ops/knowledge/procedures.yaml`). Each procedure is a typed
 template with ordered steps, each step having `action` (from the twin's
 vocabulary allowlist), `params`, `expected_state`, `abort_on`, and
@@ -352,7 +365,14 @@ the procedure enters the catalog.
 
 ### D-3. Catalog coverage: 4 causes × 2 procedures each
 
-**Decision:** Phase 1 ships with **4 fully-developed causes**, each with
+> **Status (updated 2026-08-30):** this decision is **superseded by the
+> incoming digital twin** (see [§14](#14-incoming-the-digital-twin-branch)
+> and D-10/D-11). The actual catalog scope is set by the twin: 13 causes,
+> 9 procedures, ~21 cause-procedure edges. This entry is preserved as the
+> *original rationale* — the new decision is documented in D-10 and D-11.
+> The tradeoff table below is kept for historical context.
+
+**Decision (original):** Phase 1 ships with **4 fully-developed causes**, each with
 **2 fully-developed procedures**. Total: 8 procedures. Every cause has
 a real `symptom_pattern`, `propagation_path`, `candidate_procedures`,
 and `references`. No stubs. No "shape-only" entries.
@@ -460,7 +480,13 @@ narrator, and that's where it stays.
 
 ### D-7. Twin scope: 3 subsystems (Comms, Power, Thermal) as the example
 
-**Decision:** the Phase 1 twin models 3 example subsystems: Comms,
+> **Status (updated 2026-08-30):** this decision is **superseded by the
+> incoming digital twin** (see [§14](#14-incoming-the-digital-twin-branch)
+> and D-11). The actual twin scope is being supplied by the owner and
+> covers more than 3 subsystems. This entry is preserved as the
+> *original rationale* — the new decision is documented in D-11.
+
+**Decision (original):** the Phase 1 twin models 3 example subsystems: Comms,
 Power, Thermal. This is a closed-world example, not a general
 satellite simulator.
 
@@ -504,6 +530,155 @@ implementation is one file).
 Decisions about file layout, ADRs, testing, commits, and branches are
 in [§11 Repo conventions](#11-repo-conventions). These are policy
 decisions and the rationale lives there.
+
+---
+
+### D-10. The cause catalog and the twin procedure registry are the same file
+
+> **Status (added 2026-08-30):** this decision is **new**, driven by the
+> incoming digital twin. The original D-1 and D-2 framed the catalogs as
+> hand-authored YAML; this is replaced by a single Python module
+> (`mission_ops/twin/procedures.py`) that defines the causes, the
+> procedures, the parameter schemas, the pre/post-conditions, the
+> approval requirements, **and** the `apply_procedure(state, procedure,
+> params)` function the twin uses to execute them.
+
+**Decision:** the cause enum, the procedure enum, the procedure
+parameter schemas (with bounds), the precondition/postcondition
+predicates, the approval requirement per procedure, and the twin's
+`apply_procedure()` function are **all defined in a single Python
+module**. Both the catalog and the twin import from it. There is no
+YAML or JSON file separately loaded at runtime.
+
+**Alternatives considered:**
+
+- **(a) YAML catalog + Python twin** (the original D-1/D-2 plan). A
+  YAML file holds the catalog; a Python module holds the twin's
+  `apply_procedure()` function. The twin validates that the catalog's
+  procedure IDs match the ones it can execute.
+  - **Rejected** because the validator is run at startup; if the
+    catalog and the twin are edited independently (the most likely
+    real-world path), they can drift until the next restart, and the
+    validator only catches *registered* mismatches, not semantic ones
+    (e.g., a procedure whose parameter schema changed but the catalog
+    still has the old defaults).
+- **(b) Code-generated catalog from a typed schema.** Use a
+  code-generator that produces the catalog from a schema definition.
+  - **Rejected** for Phase 1 because (i) it adds a build step, (ii)
+    the schema generator is itself code that has to be maintained,
+    (iii) the drift it prevents is the same drift that (a) prevents,
+    less robustly.
+- **(c) Single Python module (chosen).** The catalog *is* the code.
+  The cost is that editing the catalog is editing code (it goes
+  through the same review as code), but the benefit is that the
+  catalog cannot lie about what the twin can do, because both come
+  from the same file.
+
+**Why we chose what we chose:** the catalog and the twin are coupled
+by definition — the catalog says "procedure X is available for cause
+Y," the twin says "procedure X does Z to state S." If they live in
+separate files, they can drift in ways that produce silently wrong
+diagnoses (catalog says a procedure exists and is safe; twin
+crashes or behaves differently at runtime). Putting both in one file
+makes drift *structurally impossible* — you cannot change the
+twin's behavior without changing the catalog entry that references
+it, and vice versa.
+
+**Tradeoff:** the catalog is now code, not data. Ops engineers cannot
+update it via a config-file change alone; they need a PR. This is
+acceptable for telos because (i) the catalog changes infrequently
+relative to code changes, (ii) the PR review is the right place for
+ops-engineer review anyway, (iii) the data/code distinction was
+always slightly artificial — the YAML was always going to need a
+schema validator that lived in code.
+
+**API contract:**
+
+```python
+from mission_ops.twin.procedures import (
+    Cause, Procedure, PROCEDURE_REGISTRY,
+    get_candidate_procedures, apply_procedure,
+)
+
+# Diagnose stage
+diagnosis: Cause = Cause.EPS_INTERNAL_R_RAMP  # exactly one of the enum values
+
+# Propose stage
+candidates: list[Procedure] = get_candidate_procedures(diagnosis)
+spec = PROCEDURE_REGISTRY[Procedure.EPS_SHED_NON_ESSENTIAL_LOAD]
+spec.validate_params({"load_reduction_a": 1.5, "duration_s": 300})
+
+# Validate / twin
+new_state = apply_procedure(current_state, Procedure.EPS_SHED_NON_ESSENTIAL_LOAD, params)
+```
+
+**Future evolution:** if the catalog grows past ~50 causes, splitting
+*back* into a generated catalog (option b) becomes worth the build
+step. Until then, single module is the right call.
+
+---
+
+### D-11. Catalog scope: 13 causes, 9 procedures, ~21 edges, 5+ subsystems
+
+> **Status (added 2026-08-30):** this decision is **new**, driven by the
+> incoming digital twin. The original D-3 said "4 causes × 2 procedures
+> each"; this is the actual scope from the owner's twin spec.
+
+**Decision:** the Phase 1 catalog has **13 causes** (12 diagnosable
+faults + 1 `no_fault_detected` sentinel), **9 unique procedures**, and
+**~21 cause-procedure edges** (some procedures are valid for multiple
+causes; the cause→procedure map is the source of truth in
+`get_candidate_procedures()`). The twin models **5+ subsystems**:
+EPS (channels P-1, P-2), Battery (B-1), Thermal (B-1, T-1, T-2),
+ADCS (A-1, G-1), Comms (D-1), plus a `sensor_noise` meta-cause.
+
+**Why this is the scope, not something smaller or larger:**
+
+- The catalog scope is the twin's scope. A smaller catalog would
+  mean inventing causes and procedures the twin can't actually
+  simulate, which is exactly the drift D-10 prevents.
+- A larger catalog (50+ causes) would mean the owner is doing FM-doc
+  authorship work that the project doesn't need; the 13 causes here
+  are the ones the twin can demonstrate, which is what the demo
+  needs.
+
+**The 13 causes:**
+
+`eps_internal_r_ramp`, `eps_load_step`, `battery_overdischarge`,
+`battery_undervoltage`, `thermal_heater_stuck_off`,
+`thermal_heater_stuck_on`, `thermal_runaway`, `adcs_star_tracker_lost`,
+`wheel_saturation`, `solar_degradation`, `comm_ground_station_lost`,
+`sensor_noise`, `no_fault_detected`.
+
+**The 9 procedures:**
+
+`eps_shed_non_essential_load`, `eps_increase_charging_priority`,
+`thermal_enable_heater_backup`, `thermal_throttle_payload`,
+`adcs_switch_to_safe_hold`, `adcs_reset_star_tracker`,
+`comms_postpone_downlink`, `mode_change_to_safe`, `wait`.
+
+**Channel taxonomy (preliminary, finalized when the twin lands):**
+
+P-1 (EPS bus voltage), P-2 (solar panel current), B-1 (battery
+state-of-charge / temperature shared with thermal), T-1, T-2
+(thermal sensor readings), A-1 (ADCS star-tracker error), G-1
+(ADCS reaction-wheel speed), D-1 (comms link margin).
+
+**Approval terminology (preliminary, finalized when the twin lands):**
+
+The owner's spec uses `auto`, `operator`, `director`, with
+`low/medium/high` risk qualifiers on the operator path. The BIBLE
+will be updated to map these to A/B/C/D (or to retain the owner's
+3-tier scheme if that's preferred) once the twin's full approval
+metadata is in. See §7 for the proposed mapping table.
+
+**Future evolution:** as the owner adds causes (e.g., propulsion,
+payload-specific faults), each new cause goes in as a new
+`Cause` enum value, each new procedure as a new `Procedure` enum
+value, and the cross-references update in one file. The structural
+review (does the cause's symptom pattern match a real failure
+mode? is the procedure's effect physically correct?) is what
+matters, not the file count.
 
 ---
 
@@ -1023,6 +1198,118 @@ The LLM has no path to it.
 (telemetry, twin state, twin simulation trace, model weights,
 policy bundle) that a runbook references. Together with the Merkle
 chain over the steps, this is what makes a runbook auditable.
+
+**Channel** — a named telemetry stream on a single physical quantity
+(e.g., P-1 is the EPS bus voltage, D-1 is the comms link margin).
+The full set of channels in telos is documented in
+`mission_ops/twin/procedures.py`'s channel definitions, with the
+owner-supplied mapping to subsystems.
+
+**Subsystem** — a logical grouping of channels that share a function
+on the spacecraft. telos's subsystems: EPS (channels P-1, P-2),
+Battery (B-1, shared with Thermal for temperature), Thermal
+(B-1, T-1, T-2), ADCS (A-1, G-1), Comms (D-1). The set of subsystems
+is determined by the twin; the BIBLE catalogs it for cross-reference.
+
+**Sentinel cause** — a `Cause` enum value that represents "no fault
+present," used to terminate the Diagnose stage when no symptom
+pattern matches. In telos this is `no_fault_detected`. Sentinel
+causes do not require a procedure; the system is at rest.
+
+---
+
+## 14. Incoming: the digital twin branch
+
+> **Status (added 2026-08-30):** the digital twin is being integrated
+> in the `feature/digital-twin` branch. This section is the
+> pre-integration plan; it will be rewritten with the actual final
+> state once the branch is merged into `main`.
+
+### The branch
+
+- **Branch name:** `feature/digital-twin`
+- **Base:** `main` at HEAD when this section was added.
+- **Owner of the branch:** the project owner. The twin is being
+  supplied by the owner as a separate repo (or set of files) to be
+  merged into this branch.
+- **Integration responsibility:** the assistant merges the owner's
+  twin code into `feature/digital-twin`, resolving any conflicts.
+  No new architectural decisions are made during the merge without
+  being added to this BIBLE first.
+
+### What's in the incoming twin
+
+- **Subsystems (5+):** EPS, Battery, Thermal, ADCS, Comms (plus
+  a `sensor_noise` meta-cause that crosses subsystems).
+- **Channels (8):** P-1, P-2, B-1, T-1, T-2, A-1, G-1, D-1.
+  Each channel has a typed definition, units, nominal range,
+  and abnormal thresholds (defined in the twin module).
+- **Causes (13):** see D-11. 12 diagnosable faults + 1
+  `no_fault_detected` sentinel.
+- **Procedures (9):** see D-11. Each with typed parameters
+  (min/max bounds), preconditions, postconditions, and an approval
+  requirement.
+- **Twin function:** `apply_procedure(state, procedure, params) -> new_state`.
+  Pure function, deterministic, side-effect-free (no I/O, no clock,
+  no network).
+
+### Architectural decisions that landed with the twin
+
+- **D-10:** the catalog and the twin are the same Python file
+  (`mission_ops/twin/procedures.py`). See D-10 for the rationale
+  (drift prevention).
+- **D-11:** catalog scope is 13 causes × 9 procedures × ~21 edges.
+  See D-11 for the rationale (catalog scope = twin scope).
+
+### What this BIBLE will need to be updated to capture post-merge
+
+When the `feature/digital-twin` branch lands, the following need
+a post-merge BIBLE update in the same commit:
+
+- **D-3 and D-7:** the "superseded by incoming twin" notes need to
+  be replaced with final-form decisions. The tradeoff tables and
+  rationale can be kept as historical context or condensed; the
+  final decision statement at the top of each needs to reflect the
+  actual final scope.
+- **§5 "The hand-authored knowledge catalogs":** needs to be
+  rewritten to describe the single-Python-module catalog (D-10)
+  instead of the YAML loader. The example YAML shape sketches can
+  be replaced with example Python enum + spec definitions.
+- **§6 "The digital twin":** needs to be rewritten from "twin
+  scope being re-specified" to "twin scope is the 5+ subsystems,
+  13 causes, 9 procedures documented in
+  `mission_ops/twin/procedures.py`."
+- **§7 "Trust and approval":** the 3-tier vs 4-class question
+  needs a final answer. The mapping table I drafted in the plan
+  needs to be replaced with the owner's actual approval vocabulary
+  from the twin spec, mapped to A/B/C/D (or to a different scheme
+  if the owner prefers).
+- **Glossary:** the new channel and subsystem entries need their
+  final definitions (units, nominal ranges, abnormal thresholds)
+  copied in from the twin module.
+
+The merge commit (or its immediate follow-up) must contain a
+BIBLE-only commit that makes the above updates. **No `main`
+commit that contains code from the twin branch is acceptable
+without the corresponding BIBLE updates in the same PR.** This
+is a hard rule, encoded here so future agents don't skip it.
+
+### What the merge must NOT do
+
+- **Do not** change the names or types of the existing public APIs
+  in `live/` or `telemanom/`. The Detect stage contract is locked.
+- **Do not** introduce LLM dependencies. The LLM is a Phase 4
+  narrator; the twin branch is LLM-free.
+- **Do not** introduce OPA, NATS, Redis, or any Phase 2/3
+  infrastructure. The twin is the in-process deterministic
+  simulator; the bus is the in-process `asyncio.Queue`.
+- **Do not** introduce a database. State is in-memory; the only
+  on-disk artifacts are the trained LSTM weights (already in
+  `models/`) and the runbook JSON (Phase 3).
+- **Do not** rewrite the existing `live/` or `telemanom/` code.
+  Add new code under `mission_ops/`; do not touch old code.
+- **Do not** add a CI configuration without an explicit owner
+  request. CI is not in the current scope.
 
 ---
 
