@@ -89,23 +89,32 @@ the LLM (when added in Phase 4) is a narrator — never an authority.
 ## 2. The 7-stage pipeline
 
 ```
-[Telemetry source: live/sim.py producer or replay]
+[Telemetry source: live/generator.py producer or replay]
                   | tick(actual, predicted)
                   v
-1. DETECT      wraps live/error_stream.ErrorStream
-               emits SymptomEvent (per-channel deviation signal)
+1. DETECT      live/error_stream.py — LSTM + EWMA + dynamic threshold
+               emits AlertEvent {t, score, seq, kind}
                   |
-                  v
-2. DIAGNOSE    pattern-matches SymptomEvents against cause catalog
+                  v  (re-typed by live/twin_bridge.py)
+2. DIAGNOSE    digital-twin/twin/diagnose.py — pattern-matches
+               SymptomEvent window against the Cause registry
                returns ranked CandidateCause[] with evidence chain
                   |
                   v
-3. PROPOSE     looks up procedure catalog by cause
-               returns concrete Procedure with typed steps + dry-run state diff
+3. PROPOSE     digital-twin/twin/propose.py — VALIDATION-BASED
+               RANKING: calls validate_procedure() for every
+               candidate Procedure, ranks by risk_score
+               returns Proposal with the full ranking attached
                   |
                   v
-4. VALIDATE    runs procedure through sidecar digital twin
-               returns Verdict = OK | REJECT(reason) | INCONCLUSIVE(...)
+4. VALIDATE    digital-twin/twin/validate.py — projects the twin
+               forward horizon_s with the procedure applied,
+               TWO-TRAJECTORY model (predicted vs no-action baseline)
+               returns ValidationResult
+                  |  wrapped by
+                  v
+            digital-twin/twin/verdict.py — to_verdict() maps
+               ValidationResult to Verdict = OK | REJECT | INCONCLUSIVE
                   |
                   v
 ─────────────────────────────────────── Phase 1 boundary ───────────────────────────────────────
@@ -116,95 +125,359 @@ the LLM (when added in Phase 4) is a narrator — never an authority.
 7. VERIFY    (deferred) Merkle-chained runbook + content-addressed evidence + replay harness
 ```
 
+The Phase 1 boundary is the line between "the system can propose what
+should happen" and "the system can act on what should happen." Stages
+1–4 produce structured recommendations; Stages 5–7 turn recommendations
+into auditable actions. The boundary is structural — there is no code
+path that crosses it in Phase 1.
+
 ### Stage 1 — Detect
 
-**What it does:** continuously scores telemetry against an LSTM-predicted
-baseline, emits a per-channel deviation signal when the smoothed error
-exceeds a learned threshold.
+**What it does:** continuously scores live telemetry against an
+LSTM-predicted baseline, smooths the prediction error with an EWMA
+filter, runs the telemanom thresholding/pruning/scoring pipeline on
+the smoothed-error window, and emits a per-channel deviation signal
+when the smoothed error breaks the dynamically-chosen threshold.
 
-**Where it lives:** `live/error_stream.py` (existing) wrapped by
-`mission_ops/stages/detect.py` (Phase 1).
+**Where it lives:** the `live/` package. Five modules totaling ~1,000
+lines:
+- `live/generator.py` (125 lines) — synthetic sinusoid + thread-safe
+  injection queue. The HTTP `/inject` endpoint queues a
+  `spike | shift | dropout` anomaly that the producer loop picks up on
+  the next tick. `shift` auto-expires after `shift_duration_ticks=30`
+  so the demo shows both the onset and the recovery.
+- `live/model_runner.py` (81 lines) — wraps the LSTM (`keras.models.load_model`)
+  with a `predict(window) -> np.ndarray` interface. The actual model
+  is a 2-layer LSTM(80) with dynamic thresholding (Hundman et al., 2018).
+- `live/error_stream.py` (445 lines) — the streaming port of the
+  telemanom `Errors` class. Maintains an EWMA-smoothed error buffer
+  (`deque(maxlen=l_s + n_predictions)`) and runs the four-stage
+  pipeline (`find_epsilon` → `compare_to_epsilon` → `prune_anoms` →
+  `score_anomalies`) on the trailing window each tick. This is the
+  *port* — the math is identical, the I/O is per-tick instead of batch.
+- `live/ws_server.py` (362 lines) — the FastAPI surface. `GET /`
+  serves the dashboard HTML; `WS /stream` broadcasts one JSON
+  message per tick; `POST /inject` queues an anomaly; `POST
+  /inject_twin_fault` runs the Phase 1 pipeline (see "Bridge" below).
+- `live/config.py` (95 lines) — the `LiveConfig` dataclass. Default
+  tick rate is 5 Hz (`TICK_HZ = 5.0`); the integration test tunes
+  this to 25-50 Hz so the demo warms up fast.
 
-**What it consumes:** `(actual_value, predicted_value)` per tick.
+**What it consumes:** `(actual_value, predicted_value)` per tick, plus
+the LSTM's window of past values.
 
-**What it produces:** `SymptomEvent {channel, kind, score, seq, ts}` where
-`channel` and `subsystem` are derived from `subsystems.yaml`.
+**What it produces:** `AlertEvent {t, score, seq, kind}` (defined in
+`live/error_stream.py:41-46`). The `t`, `score`, and `seq` fields are
+the live-stream indices and the severity score from
+`score_anomalies`. The `kind` field is forward-looking ("anomaly" today,
+"shift"/"spike"/"dropout" once the generator attaches kind metadata).
 
-**LLM involvement:** none.
+**Important constraint:** the live `AlertEvent` does **not** carry
+`channel` or `subsystem` — those are derived later by the bridge from
+the `channel_hint` passed in by the caller (typically the
+`channel` query param on `/inject_twin_fault`). A Phase 2 polish item
+is to plumb `channel` into `AlertEvent` itself (see §3.3 and
+the `alerts_to_symptom_events` legacy hardcode in
+`live/twin_bridge.py:138-180`).
+
+**LLM involvement:** none. Detect is pure-Python + numpy + pandas + the
+keras LSTM. No LLM SDK is imported anywhere in `live/`.
 
 ### Stage 2 — Diagnose
 
-**What it does:** given a stream of `SymptomEvent`s over a sliding time
-window, match them against a hand-authored cause catalog and return ranked
-candidate causes with the evidence chain attached.
+**What it does:** given a window of `SymptomEvent`s, score every Cause
+in the registry against the window's evidence and return the ranked
+list. The score is a sum of three terms; the threshold is
+`MIN_DIAGNOSE_SCORE = 0.5`.
 
-**Where it lives:** `mission_ops/stages/diagnose.py` (Phase 1).
+**Where it lives:** `digital-twin/twin/diagnose.py` (152 lines).
+Defines the `SymptomEvent` dataclass (frozen, with `channel`,
+`subsystem`, `kind`, `score`, `seq`, `ts`), the `CandidateCause`
+dataclass, the scoring constants, and the `diagnose(window: list[SymptomEvent])
+-> list[CandidateCause]` function.
 
-**What it consumes:** a sliding window of `SymptomEvent`s (default: 1
-minute, configurable per cause).
+**What it consumes:** a window of `SymptomEvent`s. There is no hard
+window-size; the consumer (the bridge) decides how many events to
+pass. The `slight_shift_demo.py` script passes 3; the
+`phase1_demo_deep.py` script passes 3; the live pipeline passes
+whatever the live ErrorStream has flagged in its recent window.
 
-**What it produces:** `Diagnosis {candidates: list[CandidateCause],
-window: tuple[int, int], evidence_chain: list[EvidenceRef]}` where each
-`CandidateCause` is `{cause_id, score, matched_conditions,
-unmatched_conditions, evidence_refs, references}`.
+**What it produces:** `list[CandidateCause]` ranked by score, where
+each `CandidateCause` carries `cause: Cause`, `score: float`,
+`matched_events: list[SymptomEvent]`, and
+`evidence_subsystems: list[str]`. The top of the list is the system's
+best guess; ties are broken by stable sort (catalog order).
 
-**LLM involvement:** in Phase 4 only — narrator role. The LLM writes prose
-*around* the already-ranked list, citing the matched conditions. The LLM
-does **not** pick the top cause.
+**Scoring rubric** (per Cause, per event in the window; the actual
+`+0.25` / `+0.5` / `+1.0` numbers are in `diagnose.py:13-20`):
 
-### Stage 3 — Propose
+- **`+1.0`** if `SymptomEvent.channel in Cause.expected_channels()`
+  — the strongest signal: an anomaly on a channel the cause is
+  *known* to affect.
+- **`+0.5`** if `SymptomEvent.subsystem in Cause.affected_subsystems()`
+  but the channel is not in the expected list — the cause might
+  explain this through cross-subsystem coupling (e.g., `eps_internal_r_ramp`
+  affecting `B-1` battery temperature even though `B-1` is owned by
+  Thermal).
+- **`+0.25`** "stickiness bonus" per additional event in the same
+  window that already scored for this cause — a small bonus that
+  prefers causes that explain the *whole* window, not just the
+  latest event. This is what lets Diagnose prefer a cause that
+  scored 1.0 once and 0.25 twice (total 1.5) over a cause that
+  scored 1.0 once on a different channel (total 1.0).
+- **0** if neither channel nor subsystem overlaps — the cause is
+  ruled out for that event.
 
-**What it does:** given a `Diagnosis`, select a concrete `Procedure` from
-the procedure catalog and compute the dry-run state diff (predicted state
-after each step) using the twin in sandbox mode.
+**Threshold:** if no cause scores `>= MIN_DIAGNOSE_SCORE` (default
+0.5), the diagnosis is `Cause.NO_FAULT_DETECTED` (a sentinel; the
+pipeline returns the OK verdict and stops).
 
-**Where it lives:** `mission_ops/stages/propose.py` (Phase 1).
+**Tie behavior:** when multiple causes score identically (the
+common case for thermal causes on a single channel, or EPS causes
+on `P-1`), stable sort picks the first by catalog order. The Phase 1
+demo is honest about this — the system surfaces "we have 3
+plausible thermal causes tied at score 5.0; we picked
+`thermal_heater_stuck_off` because it was first in the registry."
+A future Diagnose improvement is to add a `kind` field to the
+`expected_channels` rubric so a `shift` event scores higher for
+`thermal_heater_stuck_on` than for `thermal_heater_stuck_off` (see
+§3.3 deferred).
 
-**What it consumes:** `Diagnosis` (top-1 cause preferred, top-k fallback).
-
-**What it produces:** `Proposal {proposal_id, cause_id, cause_score,
-evidence_chain, procedure, dry_run_state_diff, risk_class, provenance,
-citations}`.
-
-**LLM involvement:** in Phase 4 only — proposer role for novel-cause
-cases. The LLM's output is constrained to a JSON schema; the LLM cannot
-invent `action` values outside the twin's step vocabulary. Every
-LLM-drafted procedure requires explicit human sign-off before being
-added to the catalog.
-
-### Stage 4 — Validate
-
-**What it does:** run the `Proposal`'s procedure through the sidecar
-digital twin step by step. Compare predicted state to each step's
-`expected_state` and `abort_on` conditions. Return a verdict.
-
-**Where it lives:** `mission_ops/stages/validate.py` (Phase 1).
-
-**What it consumes:** `Proposal` (from Stage 3).
-
-**What it produces:** `Verdict {proposal_id, status, reason,
-per_step_outcomes, twin_simulation_digest, notes}` where `status` is one
-of `OK | REJECT(reason) | INCONCLUSIVE(what_we_need_to_know)`.
+**Independence property:** Diagnose does not know how the symptom
+events were generated. It scores the same window the same way
+whether the events came from a live LSTM alert or a synthetic
+seeding. The bridge translates *how the data was injected* (via
+`INJECTION_TO_FAULT`) into a starting state for Validate, but
+Diagnose itself only sees the symptom window.
 
 **LLM involvement:** none.
 
+### Stage 3 — Propose
+
+**What it does:** given a `Cause` and the current twin state, pick the
+best `Procedure` by twin-validated risk. **Propose does not pick by
+catalog rank or `default_procedure_id`.** It calls
+`validate_procedure()` for *every* candidate procedure returned by
+`get_candidate_procedures(cause)`, ranks them by the
+`risk_score` Validate returns, and picks the lowest.
+
+This is the **validation-based ranking** decision (D-12). It is the
+biggest departure from the original "Propose looks up a procedure by
+catalog" framing in earlier BIBLE drafts. The reasoning: the twin is
+the source of truth for "what will happen if I apply procedure X to
+state S." Letting it do the ranking means Propose is honest — it
+picks what the twin says is best, not what the catalog says should be
+best. The cost is the time to validate every candidate (~30-120ms
+for the demo loop's 2-3 candidates, which is invisible to the
+operator).
+
+**Where it lives:** `digital-twin/twin/propose.py` (154 lines).
+Defines the `Proposal` dataclass (`cause`, `cause_score`, `procedure`,
+`procedure_params`, `risk_score`, `validation`, `verdict`,
+`candidates_ranked`) and the `propose(cause, starting_state, ...)`
+function.
+
+**What it consumes:** a `Cause` (from Stage 2), a starting twin
+state (a `dict` matching the `twin.state.make_default_state()` shape),
+and optional `horizon_s` / `dt_s` for the validation horizon
+(defaults: 3600s / 120s = 1 hour at 2-minute steps; the integration
+test uses 14400s / 60s = 4 hours at 1-minute steps).
+
+**What it produces:** `Proposal` with the winning procedure, the
+chosen `procedure_params` (read from `PROCEDURE_REGISTRY[procedure].default_params`
+via `get_default_params(procedure)`), and the full ranking for the
+runbook (`candidates_ranked: list[tuple[Procedure, float, ValidationResult]]`).
+The `to_dict()` method produces a JSON-serializable form for the
+WebSocket broadcast.
+
+**The ranking loop** (`propose.py:125-141`):
+
+```python
+validated = []
+for proc in candidates:
+    params = get_default_params(proc)
+    result = validate_procedure(
+        starting_state, proc, params,
+        horizon_s=horizon_s, dt_s=dt_s,
+    )
+    validated.append((proc, result.risk_score, result))
+validated.sort(key=lambda x: x[1])  # lower risk wins
+best_proc, best_risk, best_validation = validated[0]
+best_verdict = to_verdict(best_validation, best_proc, cause)
+```
+
+This is *not* parallelized (it's a `for` loop, not a
+`ThreadPoolExecutor` map). The per-procedure validation is ~30-50ms;
+sequential execution of 2-3 candidates is well under the
+operator's patience budget and avoids the locking complexity a
+thread pool would introduce on the shared twin state. If the
+candidate set grows past ~10 procedures (it won't in Phase 1 — the
+largest cause's candidate set is 3), this is the place to add
+parallelism (see D-12's "Future evolution").
+
+**Edge case:** if a cause has no candidate procedures (defensive
+guard, shouldn't happen for any of the 13 Cause values), Propose
+returns a `WAIT` proposal as the safe default. The pipeline never
+blocks.
+
+**LLM involvement:** none. Propose is pure-Python + the twin
+subroutines. The LLM is a Phase 4 future narrator; it does not
+participate in procedure ranking.
+
+### Stage 4 — Validate
+
+**What it does:** project the twin forward from a starting state
+with a proposed procedure applied, return the predicted state at
+each timestep **plus a no-action baseline** for direct comparison,
+and surface constraint violations, a risk score, and a postcondition
+check.
+
+**Where it lives:**
+- `digital-twin/twin/validate.py` (306 lines) — the actual
+  simulation. Defines the `ValidationResult` dataclass
+  (`feasible`, `violations`, `risk_score`, `predicted_trajectory`,
+  `baseline_trajectory`, `summary`, `postcondition_check`) and the
+  `validate_procedure(starting_state, procedure, params, ...)` function.
+- `digital-twin/twin/verdict.py` (136 lines) — the BIBLE-shaped
+  wrapper. Defines the `Verdict` dataclass (`proposal_id`, `status`,
+  `reason`, `per_step_outcomes`, `twin_simulation_digest`, `notes`),
+  the `VerdictStatus` enum (`OK | REJECT | INCONCLUSIVE`), the
+  `RISK_THRESHOLD_INCONCLUSIVE = 0.3` constant, and the
+  `to_verdict(validation, procedure, cause) -> Verdict` function.
+
+**What it consumes:** a `Procedure` (from Stage 3), validated
+parameters (the `ProcedureSpec.validate_params(params)` call at the
+top of `validate_procedure` raises `ValueError` on bad params; the
+defaults always validate by construction), and the same
+`starting_state` Stage 3 used.
+
+**What it produces:** `ValidationResult` with both
+`predicted_trajectory` (the procedure applied) and
+`baseline_trajectory` (no action) as `dict[str, np.ndarray]` keyed
+by state field (`battery_soc`, `battery_voltage_v`, `battery_temp_c`,
+`payload_temp_c`, `electronics_temp_c`, `radiator_temp_c`,
+`pointing_error_deg`, etc.). Each array has `horizon_s / dt_s + 1`
+entries. The `summary` field is a one-line human-readable roll-up;
+the integration test asserts the `predicted` and `baseline` arrays
+have the same shape so consumers can plot them side-by-side.
+
+**The two-trajectory model** (`validate.py:_run_forward`):
+
+The function runs the twin forward twice — once with
+`apply_procs=[]` (the baseline) and once with the procedure applied
+for its full duration. The twin's `step_eps`, `step_thermal`, and
+`step_adcs` are called at every `dt_s` step; the procedure's
+`apply_procedure(state, procedure, params)` is called once at
+`start_t` and the state is restored to a pre-procedure snapshot at
+`end_t`. This is what makes the trajectory table in
+`phase1_demo_deep.py` and `slight_shift_demo.py` show the
+*delta* — the columns are always
+`pred <field>` vs `base <field>`.
+
+**Constraint checking** (`validate.py:_check_violations`): six
+fields are checked per timestep:
+- `battery_soc`: `[0.10, 1.00]` (never below 10%)
+- `battery_voltage_v`: `[24.0, 32.0]` (24V is LVC for 28V bus)
+- `battery_temp_c`: `[-20.0, 60.0]` (Li-ion survival)
+- `electronics_temp_c`: `[-20.0, 70.0]`
+- `payload_temp_c`: `[-20.0, 60.0]`
+- `pointing_error_deg`: `[0.0, 10.0]` (use absolute value; 10°
+  is unacceptable)
+
+A trajectory that hits any of these (one violation per field is
+enough) is `feasible=False`.
+
+**Risk score** (`validate.py:_compute_risk`): 0 to 1, lower is
+safer. Computed as `0.5 * violation_rate + 0.5 * min(1.0, soc_diff * 2.0)`
+where `soc_diff` is the SoC drop relative to the baseline (a
+procedure that doesn't help the battery is risky even if it doesn't
+violate a hard constraint).
+
+**Verdict mapping** (`verdict.py:to_verdict`): the wrapper maps
+`ValidationResult` to `Verdict` with three branches:
+
+1. **`REJECT`** if `!feasible` or there are constraint violations —
+   the twin predicted the procedure cannot complete safely. The
+   `reason` names the first 3 violation fields.
+2. **`INCONCLUSIVE`** if `feasible` but `risk_score >= 0.3` — the
+   twin says it works, but the margin is thin; operator review is
+   warranted. The `reason` names the procedure, cause, risk score,
+   and threshold.
+3. **`OK`** otherwise.
+
+The threshold `0.3` is a demo default; it's tunable. A future
+refactor moves it into the `LiveConfig` (or, in Phase 2, into the
+Rego policy bundle).
+
+**LLM involvement:** none. Validate is the deterministic twin
+simulation; the LLM is a future narrator that writes prose around
+the structured `Verdict` (Phase 4).
+
+### Bridge — `live/twin_bridge.py`
+
+The bridge is the **single** module in `live/` that imports from
+`twin/`. It exists so that `live/ws_server.py` can boot on system
+Python without the CHESS astropy chain, so the live test suite can
+run in any environment, and so the integration test exercises only
+this module's surface.
+
+**Where it lives:** `live/twin_bridge.py` (348 lines). The bridge
+exposes two public functions and two public tables:
+
+- `inject_fault(scheduler, kind, magnitude, channel) -> dict` —
+  translates an HTTP injection into a twin `FaultScheduler.inject()`
+  call. Returns a JSON-serializable dict with `fault_id`,
+  `fault_type`, and the scaled `parameters`.
+- `run_phase1_pipeline(fault_type, fault_params, alerts, channel_hint, ...) -> Optional[dict]`
+  — runs Diagnose → Propose → Verdict for the current injection.
+  Returns `None` if the twin can't be imported (CHESS venv missing
+  on system Python); the live server keeps running, the operator
+  just doesn't see a verdict this tick.
+- `INJECTION_TO_FAULT` — a 13-entry mapping from `(kind, channel)`
+  to `(twin fault_type, default params)`. The legacy 3 entries with
+  `channel=None` keep backward compat with the original `/inject`
+  endpoint; the 10 channel-specific entries are the demo helpers.
+- `CHANNEL_TO_SUBSYSTEM` — the 8-channel → 4-subsystem map
+  (`P-1`/`P-2` → `eps`, `B-1`/`T-1`/`T-2` → `thermal`, `A-1`/`G-1`
+  → `adcs`, `D-1` → `comms`).
+
+**Lazy-import pattern** (`twin_bridge.py:_ensure_twin_on_path`):
+the `_ensure_twin_on_path()` call lives at the top of every
+twin-using function, not at module load. The bridge module itself
+imports only stdlib + `os` + `logging` + `sys`; the `twin.*`
+imports happen inside `run_phase1_pipeline()` after the path is
+set. This is what lets the live server boot on system Python
+without pulling in the CHESS simulation. If the CHESS venv is
+missing, the `from twin.diagnose import ...` line raises; the
+bridge logs a warning and returns `None`; the live server keeps
+running; the `/inject_twin_fault` endpoint returns 503
+(`live/ws_server.py:167-173`).
+
+**The bridge is the seam the BIBLE §14 (now §14 "Landed") calls
+for.** The reason it's the *only* importer in `live/` is D-14:
+keeping the cross-boundary knowledge in one file makes it
+auditable, testable in isolation, and replaceable (to a gRPC twin
+in Phase 2) without touching the rest of `live/`.
+
 ### Stage 5 — Approve *(deferred to Phase 2)*
 
-**What it does:** given a `Proposal` and a `Verdict`, route the action
-through the operator approval flow that matches its `risk_class`. Issue
-an `ApprovalToken` if and only if the policy says so.
+**What it does:** given a `Proposal` and a `Verdict`, route the
+action through the operator approval flow that matches its
+`risk_class`. Issue an `ApprovalToken` if and only if the policy
+says so.
 
 **Where it will live:** `mission_ops/stages/approve.py` (Phase 2).
 
-**LLM involvement:** none. **The LLM has no path to the approval gate.**
-This is enforced structurally (the LLM's tool surface does not include
-the gate), not by prompt. See [§7 Trust and approval](#7-trust-and-approval).
+**LLM involvement:** none. **The LLM has no path to the approval
+gate.** This is enforced structurally (the LLM's tool surface
+does not include the gate), not by prompt. See
+[§7 Trust and approval](#7-trust-and-approval).
 
 ### Stage 6 — Execute *(deferred to Phase 2)*
 
-**What it does:** given an `ApprovalToken` and a `Procedure`, walk the
-procedure's steps through a `CommandBus`, recording per-step input/output
-hashes and operator signatures.
+**What it does:** given an `ApprovalToken` and a `Procedure`, walk
+the procedure's steps through a `CommandBus`, recording per-step
+input/output hashes and operator signatures.
 
 **Where it will live:** `mission_ops/stages/execute.py` (Phase 2).
 
@@ -213,9 +486,9 @@ hashes and operator signatures.
 ### Stage 7 — Verify *(deferred to Phase 3)*
 
 **What it does:** build a Merkle-chained runbook from the per-step
-receipts, content-address every evidence blob (telemetry, twin state,
-twin simulation trace, model weights digest, Rego policy bundle), and
-register the runbook with the replay harness.
+receipts, content-address every evidence blob (telemetry, twin
+state, twin simulation trace, model weights digest, Rego policy
+bundle), and register the runbook with the replay harness.
 
 **Where it will live:** `mission_ops/stages/verify.py` (Phase 3).
 
@@ -223,59 +496,486 @@ register the runbook with the replay harness.
 
 ### Orchestration
 
-The supervisor (`mission_ops/supervisor.py`, ~150 lines, Phase 1) holds
-the typed `MissionState` (a pydantic model) and routes each step. It is
-**not an LLM**. All stages are pure functions
-`(state_in) -> (state_out, side_effects)`. State cannot be mutated outside
-return values. This makes replay trivial and audit natural.
+The live server's `live/ws_server.py` is the Phase 1 orchestrator
+(it plays the role the supervisor was designed for). The producer
+loop in `_step_once()` runs Detect every tick; the
+`/inject_twin_fault` endpoint runs the Diagnose → Propose →
+Validate sequence synchronously when the operator injects. The
+verdict is stashed on `app.state.live.latest_verdict` and attached
+to the next WebSocket broadcast that has an anomaly. The pipeline
+is *predictive* — it runs at injection time on the fault's
+expected behavior, not on the (not-yet-detected) LSTM alerts
+(BIBLE §2 contract; the bridge seeds a synthetic `SymptomEvent`
+with `score=1.0` when `alerts=[]` and `channel_hint` is set, so
+Diagnose has something to score).
+
+All four stages are pure functions
+`(state_in) -> (state_out, side_effects)` from the perspective of
+the caller. The Detect stage has a side effect (it logs to
+`alerts.jsonl`), but the side effect is append-only and does not
+affect the function's return value. This makes replay trivial and
+audit natural.
 
 ---
 
 ## 3. Current implementation state
 
-### What's runnable today
+This section is the project's *journal* for "what is runnable and
+what is in flight." It's organized as three sub-sections: what
+landed (Phase 1 is shipping), what we're building next (the
+frontend), and what's left for the future (Phase 2/3/4 and the
+Phase 1 polish items). The owner updates this section as the work
+progresses; the BIBLE is the source of truth for "what's
+implemented and what isn't."
 
-- **Stage 1 (Detect) — fully runnable.** `live/error_stream.py` and
-  `live/model_runner.py` together implement the streaming LSTM detector.
-  The `python -m live.sim` entrypoint boots a websocket server that emits
-  `AlertEvent`s and exposes a `/inject` endpoint for synthetic anomaly
-  injection. The `live/tests/` suite is green.
+### 3.1 — What we finished
 
-- **`telemanom/` reference — vendored, not modified.** Thresholding math
-  already ported into `live/`. No re-port needed.
+Phase 1 is shipping. All four stages of the pipeline (Detect →
+Diagnose → Propose → Validate) are runnable end-to-end, the test
+suite is green, the demos work, and the `feature/digital-twin`
+branch has been integrated.
 
-### What's designed (in plan) but not yet in code
+#### Stage 1 — Detect (`live/`)
 
-- **Stages 2–4 (Diagnose, Propose, Validate).** Full design in
-  `glowing-painting-possum.md`. Awaiting the cause and procedure
-  catalogs.
-- **Cause catalog (`mission_ops/knowledge/causes.yaml`).** 4 causes with
-  2 procedures each, scoped and structured. Catalog content is pending
-  owner review.
-- **Procedure catalog (`mission_ops/knowledge/procedures.yaml`).** Same
-  status as the cause catalog.
-- **Twin (`mission_ops/twin/`).** Scope to be specified by the owner.
-  File structure designed (`sim.py`, `state.py`, `vocabulary.py`,
-  `sandbox.py`); content awaiting the owner's twin spec.
-- **State, bus, supervisor.** Designed; not coded.
+The Detect stage is the LSTM streaming detector. It lives in
+`live/` (5 modules, ~1,000 lines total) and is the surface the
+operator interacts with. Everything in `live/` is shipping:
 
-### What's deferred (designed, not started)
+- **FastAPI server** (`live/ws_server.py`, 362 lines): serves
+  `GET /` (dashboard HTML), `WS /stream` (one JSON message per
+  tick), `POST /inject` (queue a `spike | shift | dropout` anomaly),
+  and `POST /inject_twin_fault` (the Phase 1 pipeline endpoint —
+  runs Diagnose → Propose → Validate, returns the verdict).
+- **LSTM runner** (`live/model_runner.py`, 81 lines): wraps
+  `keras.models.load_model` with a `predict(window) -> np.ndarray`
+  interface. The default model is the 2-layer LSTM(80) trained on
+  SMAP/MSL (Hundman et al., 2018).
+- **Streaming error pipeline** (`live/error_stream.py`, 445 lines):
+  the port of telemanom's batch `Errors` class to a per-tick
+  streaming API. Maintains an EWMA-smoothed error buffer and runs
+  `find_epsilon` → `compare_to_epsilon` → `prune_anoms` →
+  `score_anomalies` on the trailing window. The math is
+  identical to telemanom; the I/O is per-tick instead of batch.
+- **Synthetic generator** (`live/generator.py`, 125 lines): a
+  sinusoid + Gaussian noise generator with a thread-safe injection
+  queue. `shift` injections auto-expire after 30 ticks so the demo
+  shows both the onset and the recovery.
+- **Config** (`live/config.py`, 95 lines): the `LiveConfig`
+  dataclass. Defaults: `TICK_HZ = 5.0`, `n_predictions = 10`,
+  `window_size = 30`, `smoothing_perc = 0.15`, `l_s = 250`. The
+  integration test tunes these for fast warm-up.
 
-- **Stages 5–7 (Approve, Execute, Verify).** Interfaces designed; not
-  built. Phase 2 / Phase 3 work.
-- **LLM narrator + RAG.** Phase 4. The seam is designed (`Narrator`
-  protocol in Phase 1) but the implementation is a no-op in Phase 1.
+**Test surface:** 5 test files, 13 tests in `live/tests/`
+plus the 4 new integration tests in
+`live/tests/test_injection_bridge.py`. Two of the pre-existing
+tests (`test_load_predict`, `test_inject_shift_triggers_anomaly_over_websocket`)
+require the real keras model and fail on system Python without
+the CHESS venv; they pass when the venv is active and are the
+regression gate for when the production LSTM model is loaded.
+
+**Keras stub pattern:** `live/tests/test_injection_bridge.py`
+installs a minimal keras stand-in in `sys.modules` at import
+time, then monkey-patches `live.model_runner.LSTMRunner` with a
+`MockLSTMRunner` that always returns the last window value as
+the prediction. The same pattern is used in
+`digital-twin/examples/phase1_demo.py`. This is what lets the
+live test suite and the live demo run on system Python without
+the CHESS venv — the suite stays runnable in any environment,
+and the production model is loaded automatically when the venv
+is present.
+
+#### Stage 2 — Diagnose (`digital-twin/twin/diagnose.py`)
+
+The Diagnose stage is a pure function of a `SymptomEvent` window.
+It lives in `digital-twin/twin/diagnose.py` (152 lines) and
+defines:
+
+- `SymptomEvent` (frozen dataclass: `channel`, `subsystem`,
+  `kind`, `score`, `seq`, `ts`)
+- `CandidateCause` (`cause`, `score`, `matched_events`,
+  `evidence_subsystems`)
+- `MIN_DIAGNOSE_SCORE = 0.5` (the threshold below which the
+  diagnosis is `NO_FAULT_DETECTED`)
+- `diagnose(window: list[SymptomEvent]) -> list[CandidateCause]`
+
+The scoring rubric is `+1.0` per channel-overlap event,
+`+0.5` per subsystem-overlap event, `+0.25` stickiness bonus
+per additional matching event. See §2 Stage 2 for the rubric
+and the independence property (Diagnose does not know how the
+events were generated).
+
+**Test surface:** `digital-twin/twin/tests/test_diagnose.py`
+plus the tests in `test_propose.py` that exercise the Diagnose
+edge. Diagnose is a small surface — the tests focus on the
+threshold, the tie behavior, the `NO_FAULT_DETECTED` path, and
+the stickiness math.
+
+#### Stage 3 — Propose (`digital-twin/twin/propose.py`)
+
+Propose is the **validation-based ranking** layer (D-12). It
+calls `validate_procedure()` for every candidate procedure
+returned by `get_candidate_procedures(cause)`, ranks them by
+`risk_score`, and returns the lowest-risk candidate as the
+winning `Proposal`.
+
+The `Proposal` dataclass (`cause`, `cause_score`, `procedure`,
+`procedure_params`, `risk_score`, `validation`, `verdict`,
+`candidates_ranked`) carries enough for the operator's view
+and the Phase 3 runbook. The `to_dict()` method produces the
+JSON-serializable form the WebSocket broadcast carries.
+
+**Test surface:** `digital-twin/twin/tests/test_propose.py`
+(covering the ranking math, the default-params fall-back, the
+empty-candidate edge case) and
+`test_procedures_defaults.py` (covering the
+`PROCEDURE_REGISTRY.default_params` and the
+`get_default_params(procedure)` accessor).
+
+#### Stage 4 — Validate (`digital-twin/twin/validate.py` + `verdict.py`)
+
+Validate is the **two-trajectory** simulator. It runs the twin
+forward twice from the same starting state — once with the
+procedure applied, once without — and returns both trajectories
+side-by-side. The Verdict wrapper maps the `ValidationResult`
+to a BIBLE-shaped `Verdict {proposal_id, status, reason,
+per_step_outcomes, twin_simulation_digest, notes}` with status
+`OK | REJECT | INCONCLUSIVE`.
+
+The `to_verdict()` decision order is: `REJECT` if the trajectory
+violated any of six constraints (SoC, voltage, battery temp,
+electronics temp, payload temp, pointing error), then
+`INCONCLUSIVE` if `risk_score >= 0.3`, then `OK`. See §2 Stage 4
+for the constraint table and the risk-score formula.
+
+**Test surface:** `digital-twin/twin/tests/test_verdict.py`
+(covering the three verdict branches and the threshold
+behavior). Validate itself is tested via the
+`phase1_demo_deep.py` and `slight_shift_demo.py` scripts,
+which print the actual trajectory tables and assert the
+predictions are within tolerance.
+
+#### The twin core (`digital-twin/twin/`)
+
+The digital twin is a lumped, deterministic state machine that
+implements the 5 subsystems (EPS, Battery, Thermal, ADCS, Comms)
+across 8 channels. **2,791 lines total**, organized as:
+
+| File | Lines | Role |
+|---|---|---|
+| `state.py` | 199 | `make_default_state()` factory + the state-dict shape |
+| `eps.py` | 196 | `step_eps(state, dt_s, ...)` — terminal voltage, SoC bookkeeping, temperature-coupled internal resistance |
+| `thermal.py` | 204 | `step_thermal(state, dt_s, ...)` — 4-node RC network (battery, payload, electronics, radiator) with PASEOS-derived solar + albedo + Earth-IR + Stefan-Boltzmann emission |
+| `adcs.py` | 134 | `step_adcs(state, dt_s, ...)` — 2nd-order damped pointing + reaction wheel dynamics with saturation |
+| `fault_injection.py` | 265 | `FaultScheduler` — the 9 fault types and the per-step `apply()` callback |
+| `channel_shaper.py` | 102 | Telemanom-shaped `.npy` per channel (scaled to (-1, 1) per column) |
+| `procedures.py` | 712 | **The single source of truth** for `Cause`, `Procedure`, `ProcedureSpec`, `PROCEDURE_REGISTRY`, `apply_procedure()`, `get_candidate_procedures()` (D-10) |
+| `validate.py` | 306 | `validate_procedure()` + `ValidationResult` + the two-trajectory forward loop |
+| `propose.py` | 154 | `propose()` + `Proposal` + the validation-based ranking loop |
+| `diagnose.py` | 152 | `diagnose()` + `SymptomEvent` + `CandidateCause` |
+| `verdict.py` | 136 | `to_verdict()` + `Verdict` + `VerdictStatus` + the `0.3` threshold |
+| `run_sim.py` | 231 | The CLI entry point: `python -m twin.run_sim` runs the full 4-hour twin sim offline |
+
+**The catalog is one file** (D-10):
+`digital-twin/twin/procedures.py` defines the `Cause` enum (13
+values), the `Procedure` enum (9 values), the `ProcedureSpec`
+dataclass (param bounds, preconditions, postconditions,
+`apply_fn`, `risk_class`, `approval_required`), and the
+`PROCEDURE_REGISTRY: dict[Procedure, ProcedureSpec]`. There is
+no separate YAML or JSON file; the catalog and the twin are
+the same Python module. The drift-prevention rationale is in
+D-10.
+
+**Determinism:** the twin is fully deterministic. Same
+`starting_state` + same `procedure` + same `params` →
+byte-identical `ValidationResult`. This is the invariant
+that makes the Phase 3 Merkle chain work. There is no
+wall-clock or random input in the step functions; the only
+randomness in the system is in the live `generator.py`
+(which is for demo data, not for the twin).
+
+#### The bridge (`live/twin_bridge.py`)
+
+`live/twin_bridge.py` (348 lines) is the **single seam** between
+`live/` and `twin/` (D-14). It exposes two public functions
+(`inject_fault()` and `run_phase1_pipeline()`) and two public
+tables (`INJECTION_TO_FAULT` with 13 entries,
+`CHANNEL_TO_SUBSYSTEM` with 8 entries). The lazy-import pattern
+(`_ensure_twin_on_path()` at the top of every twin-using
+function) keeps `live/ws_server.py` bootable on system Python
+without the CHESS astropy chain. If the CHESS venv is missing,
+`run_phase1_pipeline()` returns `None`; the live server keeps
+running; `/inject_twin_fault` returns 503. See §2 Bridge for
+the full surface.
+
+#### Test gate
+
+**49/51 tests pass on system Python; 51/51 with the CHESS venv
+active.** The inventory:
+
+- **Twin tests:** 32 in `digital-twin/twin/tests/` (test_diagnose,
+  test_propose, test_verdict, test_procedures_defaults) — all
+  green.
+- **Live tests, pre-existing:** 13 in `live/tests/`
+  (test_error_stream, test_generator, test_model_runner,
+  test_integration). 11 pass; 2 fail (`test_load_predict`,
+  `test_inject_shift_triggers_anomaly_over_websocket`) because
+  they need the real keras model. The failures are *pre-existing*
+  and *expected* on system Python — they pass when the CHESS venv
+  is active.
+- **Live tests, new integration:** 4 in
+  `live/tests/test_injection_bridge.py` —
+  `test_phase1_inject_twin_fault_returns_bible_verdict` (the
+  Phase 1 success gate), plus `test_inject_twin_fault_returns_503_without_twin_scheduler`,
+  `test_inject_twin_fault_rejects_bad_channel`, and
+  `test_inject_twin_fault_passthrough_fault_type`. All 4 green.
+
+The 2 keras-gated failures are not regressions from the digital-
+twin work; they're the test suite's way of saying "the real LSTM
+model isn't loaded." The fix is to set up the CHESS venv in CI
+(not in scope for Phase 1).
+
+#### Demo surface
+
+**4 runnable demos** in `digital-twin/examples/`, all of which
+work today:
+
+- `smoke_test.py` (198 lines) — the pre-existing regression
+  test. Exercises the `FaultScheduler` end-to-end with the
+  CHESS simulation. Not run on system Python (it needs the
+  venv); kept for the regression suite.
+- `phase1_demo.py` (360 lines) — the **full live loop**.
+  Boots the FastAPI server in-process, POSTs 6 scenarios over
+  HTTP, reads from the WebSocket, prints a roll-up table.
+  Runs on system Python with the keras stub and the
+  `MockLSTMRunner`. This is the demo for "show me everything
+  connected end-to-end."
+- `phase1_demo_deep.py` (196 lines) — the **deep-dive
+  detail**. Runs the pipeline for 2 scenarios (P-1 and T-1)
+  without the HTTP layer, prints the per-cause Diagnose
+  scoring, the Propose ranking with risk scores, and the
+  Validate trajectory with 7 columns (`pred/base` SoC, V,
+  T_bat). Runs on system Python.
+- `slight_shift_demo.py` (189 lines) — the **single-scenario
+  story**. 0.2-unit shift on T-1 → `thermal_heater_stuck_on` →
+  Diagnose scores 5 thermal causes tied → Propose ranks 2
+  procedures → Validate projects 1 hour with 9 columns
+  (adds `T_pay`). All 4 stages labeled in one screen. Runs
+  on system Python.
+
+The "show the judges" demo is `slight_shift_demo.py` if the
+question is "tell me the story of one anomaly" and
+`phase1_demo_deep.py` if the question is "is the twin
+*really* simulating?" `phase1_demo.py` is the demo for
+"show me the live loop with the WebSocket broadcast."
+
+#### Branch state
+
+The `feature/digital-twin` work has been integrated. The
+BIBLE update documented in this section is part of the
+post-merge commit; the previous BIBLE §14 (the "Incoming:
+the digital twin branch" section) is rewritten as a
+"Landed" changelog in the same commit. The pre-integration
+`glowing-painting-possum.md` plan files are kept for
+historical context (see the end of this section).
+
+### 3.2 — What we're building now
+
+> **Owner-confirmed framing (2026-09-01):** the next chunk
+> of work is a **3-phase frontend** that progressively
+> visualizes the pipeline. The three phases are sequential
+> builds, not parallel views — each phase is a layer on top
+> of the previous one.
+
+The terminal demos (slight_shift_demo, phase1_demo_deep,
+phase1_demo) answer the *deep-detail* questions a judge or
+reviewer asks after an injection ("show me the per-cause
+scoring," "show me the trajectory table"). The frontend is
+the surface for the operator's view *during* a live
+injection. The two surfaces answer different questions.
+
+#### Frontend Phase 1 — live data
+
+The dashboard renders the raw telemetry stream: LSTM
+actual-vs-predicted canvas, EWMA error canvas, anomaly dots,
+alert log, inject controls. The current
+`live/static/index.html` (229 lines) has the canvases and
+the inject buttons; the Phase 1 frontend work is to
+*complete* it: stable colors, working reconnect logic, a
+channel-picker for the inject buttons (the channel mapping
+is the bridge's `CHANNEL_TO_SUBSYSTEM`, not hardcoded in the
+HTML), and a "history" panel showing the last N injects with
+their verdicts.
+
+**What this phase does *not* include:** no `twin_verdict`
+panel, no trajectory canvas. Those land in Phases 2 and 3.
+
+**Test gate:** the existing live tests cover the WebSocket
+broadcast shape (`m.twin_verdict` is null in Phase 1 because
+no verdict has been computed yet). No new test for Phase 1
+frontend; the work is dashboard polish + reconnect logic.
+
+#### Frontend Phase 2 — Detect + Diagnose + Propose
+
+Layer on top of Phase 1: when the WebSocket broadcasts a
+tick with `m.twin_verdict != null` (i.e., the operator
+injected a fault and the bridge ran the pipeline), the
+dashboard surfaces the verdict in a new panel showing the
+cause, the procedure, the risk score, the verdict status,
+and the reason. Below the verdict, a "diagnose detail"
+expander shows the per-cause scoring breakdown (which Causes
+scored what, which events matched). This is the same data
+the `phase1_demo_deep.py` script prints to the terminal —
+the frontend reads it from the WebSocket instead.
+
+**The pipeline runs the same way; only the surface changes.**
+The data is already in the WebSocket payload; the dashboard
+just renders it.
+
+**Test gate:** one new test that asserts the WebSocket
+message carries the `twin_verdict` field with the BIBLE §2
+shape (`cause`, `procedure`, `risk_score`, `verdict.status`,
+`verdict.reason`). The deep-dive expander is tested manually
+for the hackathon; an automated canvas test is out of scope.
+
+#### Frontend Phase 3 — Validate (trajectory)
+
+Add the trajectory panel: a canvas that plots
+`predicted_trajectory` and `baseline_trajectory` side-by-side
+for SoC, voltage, and payload temperature over the 1-hour
+horizon. The data is already in the `twin_verdict` payload
+(assuming we extend the payload to include the trajectories
+— this is a small backend change, not a new pipeline stage).
+The canvas is a simple time-series plot — no axes math
+library, just a `<canvas>` element with `requestAnimationFrame`.
+The `OK | REJECT | INCONCLUSIVE` badge is the final element
+of the panel, colored green/red/amber.
+
+**What the frontend is NOT:** it is not a new twin. It does
+not run a new simulator. It does not call Diagnose/Propose
+directly. It only consumes the `twin_verdict` and trajectory
+data that the live server's `_step_once()` already attaches
+to the WebSocket broadcast. **The frontend is a window, not
+a new pipeline stage.**
+
+**Test gate:** one new test that asserts the WebSocket
+message carries the trajectory payload (after the backend
+change to include it). The canvas rendering is tested
+manually for the hackathon.
+
+#### Order of frontend work
+
+The three phases land as separate commits, in order. The
+BIBLE §3.2 is updated to reflect progress as each phase
+lands. The phases are designed to be additive — Phase 2
+doesn't change Phase 1's canvas; Phase 3 doesn't change
+Phase 2's verdict panel.
+
+### 3.3 — What's left for future
+
+This is the "deferred" section: what's in plan but not in
+code, in priority order.
+
+#### Phase 2 — Approve / Execute
+
+The policy engine (OPA/Rego with a Python fallback per
+§7), the 4-class risk scheme (A/B/C/D) with the mapping
+table from the current `low/medium/high/critical` strings,
+the 2-person rule for Class D, the 30-second hold-down
+timer, the dry-run preview UI, and the `CommandBus` mock
+are all Phase 2 work.
+
+**What this means concretely:**
+
+- The `procedures.py` registry already has the
+  `approval_required` metadata per procedure
+  (`auto` / `operator` / `director` per the spec in
+  `twin/procedures.py`). Phase 2 wires it into a real
+  gate, not a registry field.
+- The `Verdict` dataclass already reserves the
+  `proposal_id` and `twin_simulation_digest` fields
+  (empty strings in Phase 1). Phase 3 fills them in.
+- The `risk_class` mapping (current strings
+  `low/medium/high/critical` → future A/B/C/D) is a
+  small mapping table. The draft mapping (low→B,
+  medium→C, high→C, critical→D) is in
+  `live/twin_bridge.py:36-37`; Phase 2 ratifies it
+  in the BIBLE §7.
+
+#### Phase 3 — Verify
+
+The Merkle-chained runbook, the content-addressed evidence
+store, the replay harness, and the 7-year retention
+hook. The runbook schema (per §8) has `runbook_id`
+(sha256-derived), `merkle_root`, `chain_head`,
+`per_step_outcomes[]` with `prev_step_hash` /
+`self_hash` chaining, and the `evidence://<sha256>`
+content-addressing for telemetry, twin state, twin
+simulation trace, model weights digest, and Rego
+bundle.
+
+#### Phase 4 — LLM narrator + RAG
+
+A post-processor on Diagnose, Propose, Validate outputs
+that writes human-readable prose around the already-
+structured data. No seam in Phase 1 code (per D-6);
+added in Phase 4 with the LLM, not as a no-op stub.
+RAG over past runbooks (produced by Phase 3) for
+novel-cause cases where `get_candidate_procedures(cause)`
+returns an empty list.
+
+#### Phase 1 polish items (deferred)
+
+These are improvements to the *current* Phase 1 surface,
+not new stages. They're documented here so they don't
+get lost:
+
+- **D-1 diagnostic gap.** Diagnose can disambiguate
+  the three thermal causes (`stuck_off` vs `stuck_on`
+  vs `runaway`) better with a richer symptom shape.
+  Today they tie at score 5.0 for a single shift on
+  T-1, and stable sort picks the first. The fix is to
+  add a `kind` field to the `expected_channels` rubric
+  so a `shift` event scores higher for `stuck_on` than
+  for `stuck_off`. This is a Diagnose improvement, not
+  a new stage; the change is in
+  `digital-twin/twin/diagnose.py` and the per-cause
+  expected-channel lists in
+  `digital-twin/twin/procedures.py`.
+- **`alerts_to_symptom_events` legacy hardcode.** The
+  bridge function at `live/twin_bridge.py:138-180`
+  hardcodes `channel="P-1"` and `subsystem="eps"` for
+  the fall-back path (no `channel_hint`). The fix is
+  to plumb `channel` into the live `AlertEvent`
+  (`live/error_stream.py:41-46` doesn't carry it
+  today) and use it. The fast path
+  (`channel_hint` provided) already uses the right
+  channel; this is just the fall-back cleanup.
+- **`risk_class` mapping.** The current `procedures.py`
+  uses `low/medium/high/critical` strings; the planned
+  §7 scheme is `A/B/C/D`. Phase 2 work.
+- **CHESS venv CI.** The 2 keras-gated tests
+  (`test_load_predict`,
+  `test_inject_shift_triggers_anomaly_over_websocket`)
+  are pre-existing failures on system Python. They
+  pass when the CHESS venv is active. CI setup is
+  out of scope for Phase 1.
 
 ### Working plan (not in the repo)
 
-- `/home/rishabh/.claude/plans/glowing-painting-possum.md` — the active
-  planning document. Updated as the design evolves.
+- `/home/rishabh/.claude/plans/yes-go-forward-implement-expressive-lobster.md`
+  — the post-merge BIBLE update plan (this section was
+  written from it).
+- `/home/rishabh/.claude/plans/glowing-painting-possum.md`
+  — the pre-merge digital-twin planning document.
+  Historical context; the actual architecture that landed
+  is in §6 of this BIBLE.
 - `/home/rishabh/.claude/plans/glowing-painting-possum-agent-ab34f718c65d76b95.md`
-  — research summary (multi-agent patterns, satellite-ops references,
-  digital-twin patterns, HITL patterns, audit patterns).
+  — research summary (multi-agent patterns,
+  satellite-ops references, digital-twin patterns, HITL
+  patterns, audit patterns). Historical context.
 - `/home/rishabh/.claude/plans/glowing-painting-possum-agent-a7ec1f2bc7082d7f2.md`
-  — early detailed design draft (superseded by the active plan and this
-  Bible, but kept for context).
+  — early detailed design draft (superseded by the
+  pre-merge plan and this BIBLE, but kept for context).
 
 ---
 
@@ -363,19 +1063,41 @@ the procedure enters the catalog.
 
 ---
 
-### D-3. Catalog coverage: 4 causes × 2 procedures each
+### D-3. Catalog coverage: 13 causes × 9 procedures × ~21 edges
 
-> **Status (updated 2026-08-30):** this decision is **superseded by the
-> incoming digital twin** (see [§14](#14-incoming-the-digital-twin-branch)
-> and D-10/D-11). The actual catalog scope is set by the twin: 13 causes,
-> 9 procedures, ~21 cause-procedure edges. This entry is preserved as the
-> *original rationale* — the new decision is documented in D-10 and D-11.
-> The tradeoff table below is kept for historical context.
+> **Status (updated 2026-09-01):** the post-merge final-form decision.
+> The pre-merge BIBLE had D-3 as "4 causes × 2 procedures" with a
+> "superseded by the incoming digital twin" note pointing at D-10/D-11.
+> With the digital-twin branch landed, the catalog scope is final
+> (13 × 9 × ~21, per D-11) and the catalog lives in a single Python
+> module (`digital-twin/twin/procedures.py`, per D-10). The original
+> 4×2 rationale and tradeoff table are preserved below as historical
+> context — they show the path we did *not* take and the reasoning.
 
-**Decision (original):** Phase 1 ships with **4 fully-developed causes**, each with
-**2 fully-developed procedures**. Total: 8 procedures. Every cause has
-a real `symptom_pattern`, `propagation_path`, `candidate_procedures`,
-and `references`. No stubs. No "shape-only" entries.
+**Decision (final, as landed):** the Phase 1 catalog is **13 causes ×
+9 procedures × ~21 cause-procedure edges**, defined in
+`digital-twin/twin/procedures.py`. 12 diagnosable faults + 1 sentinel
+`no_fault_detected` cause. The 9 procedures are reusable across
+causes (e.g., `eps_shed_non_essential_load` is a candidate for 4
+different EPS causes). The 13 causes, 9 procedures, and the
+cause→procedure map are documented in D-11 and reproduced in §6.2
+and §6.3.
+
+**Why 13 × 9 × ~21 (and not 4 × 2):** the catalog scope is the
+twin's scope. A smaller catalog would mean inventing causes and
+procedures the twin can't actually simulate, which is exactly the
+drift D-10 prevents. A larger catalog (50+ causes) would mean
+the owner is doing FM-doc authorship work that the project
+doesn't need. 13 × 9 × ~21 is what the twin supports, which is
+what the demo needs.
+
+---
+
+**Decision (original, preserved for historical context):** Phase 1
+ships with **4 fully-developed causes**, each with **2 fully-developed
+procedures**. Total: 8 procedures. Every cause has a real
+`symptom_pattern`, `propagation_path`, `candidate_procedures`, and
+`references`. No stubs. No "shape-only" entries.
 
 **The tradeoff we considered:**
 
@@ -424,11 +1146,12 @@ catalog entry.
 **Why 1 minute:** the live detector emits `AlertEvent`s at ~5 Hz (see
 `live/config.TICK_HZ = 5.0`). A 1-minute window contains up to 300 ticks
 and up to ~60 symptom events. That's enough to disambiguate the
-example 4 causes with `min_duration_ticks` in the 30–90 range. The
-slower causes (e.g., a sensor drifting over 5 minutes) have their
-own `min_duration_ticks` set higher, but they're processed on a longer
-rolling window (the loader keeps two windows: a 1-minute hot window and
-a 5-minute cold window; causes pick which they consume).
+13 causes (see §6.2) with per-cause `min_duration_ticks` in the
+30–90 tick range. Slower-developing causes (e.g., `solar_degradation`,
+a gradual drop in P-2 current) declare their own longer
+`min_duration_ticks` and are processed on a longer rolling window;
+the Diagnose stage keeps a hot 1-minute window and a cold 5-minute
+window, and each cause picks which it consumes.
 
 **Future evolution:** tune the windows per-cause as real telemetry
 patterns emerge. The current values are educated guesses based on the
@@ -457,54 +1180,127 @@ interface is designed to support it as a future addition.
 
 ---
 
-### D-6. LLM-narrator seam: visible in Phase 1, no-op implementation
+### D-6. LLM narrator: deferred to Phase 4, no seam in Phase 1 code
 
-**Decision:** Phase 1 defines a `Narrator` protocol with a no-op
-implementation (`NoOpNarrator` returns empty strings). Diagnose calls
-the narrator and the empty string is part of the structured `Diagnosis`
-output. Phase 4 plugs in an LLM implementation; Diagnose does not
-change.
+> **Status (updated 2026-08-30):** the original D-6 added a `Narrator`
+> protocol with a no-op implementation in Phase 1, on the theory that
+> it would make Phase 4 a strictly additive change. The owner reviewed
+> this and decided: no seam. Phase 1 code has **no** narrator protocol,
+> **no** no-op implementation, and **no** LLM involvement of any
+> kind. The structured outputs (Diagnosis, Proposal, Verdict) carry
+> only structured data; prose is added in Phase 4 as a post-processor.
+> This entry is kept as a future-implementation note so Phase 4 has a
+> clear spec to follow.
 
-**Why we chose what we chose:** the seam is cheap (~30 lines), makes
-Phase 4 a strictly additive change, and the no-op is genuinely
-testable (it produces a deterministic empty string, which is part of
-the byte-identical regression test). The cost is trivial; the value is
-real.
+**Future-implementation notes for Phase 4 (NOT to be acted on in Phase 1):**
 
-**Why we did not wire up an LLM in Phase 1:** no LLM agency, no
-non-determinism, no prompt-injection surface, no API key dependency.
-The regression test is byte-identical. The LLM is a Phase 4 future
-narrator, and that's where it stays.
+- **What gets added:** a `Narrator` protocol (or equivalent interface)
+  with a real LLM implementation (Claude API, local model via
+  ollama/llama.cpp, or hosted service — owner's choice). The
+  narrator is a post-processor: it takes a structured output and
+  returns a `Diagnosis` / `Proposal` / `Verdict` with a new
+  `llm_narrative` field populated.
+
+- **Where it plugs in:** three places, all as post-processors
+  (not in the critical path of stage decisions):
+  1. After Diagnose: wraps the ranked candidates + evidence chain
+     into a human-readable explanation citing the catalog entry and
+     the symptom events.
+  2. After Propose: wraps the chosen procedure + dry-run diff into
+     a human-readable explanation of why this procedure over the
+     other candidates.
+  3. After Validate: wraps the Verdict into a human-readable
+     explanation of what the twin predicted and what it means for
+     the operator.
+
+- **Structural bars (designed but not enforced in Phase 1):**
+  - The LLM has no path to issue an `ApprovalToken` (Phase 2 concern).
+  - The LLM cannot change the `Cause` enum value picked by Diagnose;
+    it can only write prose around the already-picked value.
+  - The LLM cannot change the `Procedure` enum value picked by
+    Propose; it can only write prose around it.
+  - The LLM's prose is checked for citation grounding: every claim
+    in the narrative maps to a catalog entry or an evidence ref.
+  - The LLM is a pure function of its inputs in tests (mocked at the
+    HTTP layer for hosted models, or a fixed response for local
+    models).
+
+- **What this D-6 explicitly forbids in Phase 1:**
+  - No LLM SDK in `mission_ops/requirements.txt` or `pyproject.toml`.
+  - No `Narrator` protocol or interface in Phase 1 code.
+  - No LLM in the test suite (mocks are fine, but the LLM is never
+    called in real test runs).
+  - No API keys in the repo, even in `.env.example`.
+  - No prompt-injection hardening work (deferred to Phase 4 with
+    the LLM).
+
+**Why defer the seam entirely:** the no-op seam added a tiny bit of
+code and a tiny bit of test surface for a feature that may never
+ship (Phase 4 is a real future phase but its scope is not yet
+locked). Cleaner to add the seam in Phase 4 with the LLM than to
+carry a no-op seam through every Phase 1+ commit.
+
+**Why this is not a "boring" decision:** the temptation to add the
+seam is strong because it makes Phase 4 feel cheap. It is not cheap
+in the long run: every Phase 1+ commit has to keep the no-op
+working, the regression test has to assert the empty string, and the
+schema has a `narrative: str = ""` field that no one reads. Defer
+until needed; the cost of adding the seam in Phase 4 is one new
+field, not a refactor.
 
 ---
 
-### D-7. Twin scope: 3 subsystems (Comms, Power, Thermal) as the example
+### D-7. Twin scope: 5 subsystems (EPS, Battery, Thermal, ADCS, Comms) and 8 channels
 
-> **Status (updated 2026-08-30):** this decision is **superseded by the
-> incoming digital twin** (see [§14](#14-incoming-the-digital-twin-branch)
-> and D-11). The actual twin scope is being supplied by the owner and
-> covers more than 3 subsystems. This entry is preserved as the
-> *original rationale* — the new decision is documented in D-11.
+> **Status (updated 2026-09-01):** the post-merge final-form decision.
+> The pre-merge BIBLE had D-7 as "3 subsystems (Comms, Power,
+> Thermal)" with a "superseded by the incoming digital twin" note
+> pointing at D-11. With the digital-twin branch landed, the twin
+> scope is final (5 subsystems, 8 channels, 2,791 lines in
+> `digital-twin/twin/`). The original 3-subsystem rationale and
+> tradeoff are preserved below as historical context.
 
-**Decision (original):** the Phase 1 twin models 3 example subsystems: Comms,
-Power, Thermal. This is a closed-world example, not a general
-satellite simulator.
+**Decision (final, as landed):** the Phase 1 twin models **5
+subsystems** — EPS, Battery, Thermal, ADCS, Comms — across **8
+channels** (P-1, P-2, B-1, T-1, T-2, A-1, G-1, D-1) and **13
+causes × 9 procedures × ~21 edges** (per D-3 and D-11). The twin
+is a lumped, deterministic state machine; same state + same
+procedure → same result, byte-for-byte. 2,791 lines in
+`digital-twin/twin/`; per-file line counts in §3.1.
+
+**Why 5 subsystems (and not 3):** the owner supplied the
+twin spec with all 5 subsystems. The 3-subsystem "minimum
+viable" framing was a planning-time approximation; the actual
+demo needs EPS, Battery, Thermal, ADCS, and Comms to show the
+cross-subsystem coupling that Diagnose reasons about. With 5
+subsystems, the Diagnose stage can score cross-coupling
+(`eps_internal_r_ramp` affects both EPS and Thermal because
+battery temperature couples to internal resistance; see
+§6.2 row 1). With 3 subsystems, that signal is lost.
+
+---
+
+**Decision (original, preserved for historical context):** the
+Phase 1 twin models 3 example subsystems: Comms, Power, Thermal.
+This is a closed-world example, not a general satellite
+simulator.
 
 **Alternatives considered:**
 
-- **6+ subsystems (Attitude, Propulsion, GNC, Payload, ...).** Rejected
-  because (i) the build cost scales linearly with subsystem count, (ii)
-  the credibility of a "fake physics" twin drops sharply once you
-  start modeling attitude dynamics, propulsion, and orbital mechanics,
-  (iii) we'd be writing a bad simulator rather than demonstrating the
-  validation contract.
+- **6+ subsystems (Attitude, Propulsion, GNC, Payload, ...).**
+  Rejected because (i) the build cost scales linearly with
+  subsystem count, (ii) the credibility of a "fake physics" twin
+  drops sharply once you start modeling attitude dynamics,
+  propulsion, and orbital mechanics, (iii) we'd be writing a
+  bad simulator rather than demonstrating the validation
+  contract.
 
 **Why we chose what we chose:** 3 subsystems with well-understood
-cross-coupling (thermal affects power efficiency; power affects comms
-output; comms is the primary observable) is enough to demonstrate
-cross-subsystem diagnosis and recovery. The schema generalizes;
-adding a 4th subsystem later is an additive change to
-`subsystems.yaml` and the twin's vocabulary.
+cross-coupling (thermal affects power efficiency; power affects
+comms output; comms is the primary observable) is enough to
+demonstrate cross-subsystem diagnosis and recovery. The schema
+generalizes; adding a 4th subsystem later is an additive change
+to `subsystems.yaml` and the twin's vocabulary.
 
 **Owner note:** the twin scope is being **re-specified by the owner
 post-plan.** This section will be updated when that spec lands.
@@ -682,121 +1478,878 @@ matters, not the file count.
 
 ---
 
+### D-12. Propose uses validation-based ranking, not catalog lookup
+
+> **Status (added 2026-09-01):** this decision is **new**, driven
+> by the digital-twin integration. The original BIBLE §2 framed
+> Propose as "looks up procedure catalog by cause" — that framing
+> is replaced by the validation-based ranking that actually landed
+> in `digital-twin/twin/propose.py`.
+
+**Decision:** Propose does **not** pick a procedure by
+`default_procedure_id`, by catalog rank, or by any
+`risk_class`-based heuristic. It calls `validate_procedure()`
+for *every* candidate procedure returned by
+`get_candidate_procedures(cause)`, ranks them by the `risk_score`
+that Validate returns, and picks the lowest-risk candidate that
+is still `feasible=True`. Ties are broken by stable sort
+(catalog order from `get_candidate_procedures`).
+
+The ranking loop is in `digital-twin/twin/propose.py:125-141`:
+
+```python
+validated = []
+for proc in candidates:
+    params = get_default_params(proc)
+    result = validate_procedure(
+        starting_state, proc, params,
+        horizon_s=horizon_s, dt_s=dt_s,
+    )
+    validated.append((proc, result.risk_score, result))
+validated.sort(key=lambda x: x[1])  # lower risk wins
+best_proc, best_risk, best_validation = validated[0]
+```
+
+Measured wall time: 30-120ms for the demo's 2-3 candidates at
+the default 1h/120s horizon. This is well under the operator's
+patience budget and invisible to the live broadcast rate.
+
+**Alternatives considered:**
+
+- **(a) Lookup by `default_procedure_id`** (the original BIBLE §2
+  framing). Rejected because (i) it requires the catalog to
+  know which procedure is "best" for which cause, which
+  duplicates knowledge that the twin can compute from the
+  current state, (ii) it makes the procedure ranking a static
+  property of the catalog rather than a dynamic property of
+  the starting state, (iii) it defeats the purpose of having
+  a twin at all — the twin is there to tell us what will
+  happen, not to confirm a pre-chosen answer.
+- **(b) Lookup by `risk_class`** (low-risk first, then medium,
+  then high). Rejected for the same reason: `risk_class` is
+  a static label; the actual risk depends on the starting
+  state and the parameters, and the only honest way to know
+  the risk is to run the twin.
+- **(c) Validation-based ranking (chosen).** The twin computes
+  the risk for each candidate. Propose becomes a thin ranking
+  layer over Validate.
+
+**Why we chose what we chose:** the twin is the source of truth
+for "what will happen if I apply procedure X to state S."
+Letting it do the ranking means Propose is honest — it picks
+what the twin says is best, not what the catalog says should
+be best. The cost is the time to validate every candidate;
+the benefit is that the ranking is *always* correct for the
+current state. The same cause with different starting states
+can pick different procedures, which is the right behavior —
+the operator wants the procedure that works *now*, not the
+procedure that worked last Tuesday.
+
+**Tradeoff:** the ranking is no longer deterministic from
+the catalog alone. Two runs of Propose with different starting
+states can pick different procedures for the same cause. This
+is the right behavior. The cost is that the regression test
+can't just check "this cause picks this procedure" — it has
+to either seed the state with the same defaults
+(`make_default_state()`) or check the *structure* of the
+ranking rather than the specific winner. The current
+`test_propose.py` does the former.
+
+**The ranking is sequential, not parallel.** The
+`for proc in candidates` loop runs each `validate_procedure`
+sequentially in the calling thread. A `ThreadPoolExecutor`
+map was considered; rejected because (i) the per-procedure
+validation is ~30-50ms and the sequential 2-3 candidates are
+well under the latency budget, (ii) parallel validation
+would require locking on the shared `starting_state` (Validate
+deep-copies internally, but the FaultScheduler state in the
+shared `twin.fault_injection` module would need a lock), (iii)
+the code is simpler to read sequentially. If the candidate
+set grows past ~10 procedures (it won't in Phase 1 — the
+largest cause has 3 candidates), this is the place to add
+parallelism (see "Future evolution").
+
+**Future evolution:** if the candidate set grows past ~10
+procedures, the per-candidate validation cost will dominate
+the Propose stage latency. The fix is to add a coarse
+pre-filter using the procedure's `risk_class` (skip
+`critical` procedures unless all `low/medium/high`
+candidates fail) — still using Validate as the final
+arbiter, just with a catalog-driven warm-up. Out of scope
+for Phase 1.
+
+---
+
+### D-13. The twin runs in-process, same Python interpreter as live/
+
+> **Status (added 2026-09-01):** this decision is **new**, driven
+> by the digital-twin integration. The pre-merge BIBLE §6
+> framed the twin as "sidecar" with a Phase 1
+> "in-process, Phase 2+ separate process" evolution. The
+> landed architecture is in-process for both phases; the
+> "sidecar" language was aspirational, not descriptive.
+
+**Decision:** the digital twin is loaded into the same Python
+process as the live FastAPI server. `live/ws_server.py` imports
+`twin` *lazily* (inside the function, not at module load) so
+the CHESS astropy chain is not pulled in at boot. The
+`FaultScheduler` (the part of the twin that holds active
+faults) is a singleton on `app.state.live.twin_scheduler`,
+initialized in `AppState.init_twin()` at server boot.
+
+The lazy-import pattern lives in
+`live/twin_bridge.py:_ensure_twin_on_path()`. The function
+adds the `digital-twin/` directory to `sys.path` if it isn't
+there, and is called at the top of every twin-using function
+(`inject_fault`, `run_phase1_pipeline`). The bridge module
+itself imports only stdlib + `os` + `logging` + `sys`; the
+`twin.*` imports happen inside `run_phase1_pipeline()` after
+the path is set. This is what lets the live server boot on
+system Python without the CHESS venv.
+
+**Alternatives considered:**
+
+- **(a) Twin as a separate process (subprocess or gRPC).**
+  Rejected for Phase 1 because (i) the IPC overhead is
+  non-trivial for a per-tick validation, (ii) it requires
+  shipping the starting state across the boundary, (iii) it
+  adds a deployment story we don't have time for, (iv) the
+  in-process twin is *fast* (~1ms per step) and the latency
+  is invisible to the operator.
+- **(b) Twin as a separate thread (threading, not asyncio).**
+  Considered; the validation runs in the calling thread
+  (which is the FastAPI handler thread). The
+  `FaultScheduler` state is not currently thread-safe, but
+  this is fine for Phase 1 because `/inject_twin_fault` is
+  one-call-at-a-time — FastAPI's default sync handler means
+  concurrent calls serialize on the GIL anyway.
+- **(c) In-process, lazy imports (chosen).** Fast, simple,
+  deterministic. The CHESS venv problem is solved by lazy
+  imports. The live server stays single-threaded for
+  fault-related work; the producer loop runs in its own
+  asyncio task and shares no twin state.
+
+**Why we chose what we chose:** in-process is the simplest
+deployment story and lets us treat the twin like a library
+call. The lazy-import pattern keeps the live server
+bootable on system Python. This combination lets the
+hackathon demo run on a laptop without any infra — `uvicorn
+live.ws_server:app` is the only command.
+
+**Tradeoff:** the live server can no longer boot on a system
+where the `digital-twin/` directory is missing or where the
+CHESS venv is not active — the `/inject_twin_fault` endpoint
+returns 503 in that case (per
+`live/ws_server.py:167-173`). This is the right behavior:
+tell the operator the feature is unavailable, don't crash.
+The `run_phase1_pipeline()` function returns `None` (not
+raises) if the twin can't be imported, so the live
+producer loop keeps running; the operator just doesn't see
+a verdict on that tick.
+
+**Future evolution:** Phase 2 should consider moving the
+twin to a separate process so a crash in the twin doesn't
+take down the live server. The seam is already in place —
+the `FaultScheduler` and `validate_procedure()` are
+self-contained; moving them across a gRPC boundary is a
+refactor, not a redesign. The motivation grows if the
+twin's per-step simulation cost goes up (e.g., if we add
+orbital mechanics with NRLMSISE-00). Out of scope for
+Phase 1.
+
+---
+
+### D-14. The bridge is the only place `live/` imports from `twin/`
+
+> **Status (added 2026-09-01):** this decision is **new**, driven
+> by the digital-twin integration. The pre-merge BIBLE §14
+> named "the bridge" as the seam but did not codify the rule
+> that it is the *only* importer; this entry makes the rule
+> explicit.
+
+**Decision:** `live/twin_bridge.py` is the *single* module in
+`live/` that imports from `twin/`. All other `live/` modules
+stay pure-Python and can be loaded without the CHESS venv.
+The bridge exposes two public functions — `inject_fault()` and
+`run_phase1_pipeline()` — and two public tables —
+`INJECTION_TO_FAULT` (13 entries) and `CHANNEL_TO_SUBSYSTEM`
+(8 entries).
+
+**The rule in code:** `live/ws_server.py` imports
+`live.twin_bridge` and uses `bridge.inject_fault()` and
+`bridge.run_phase1_pipeline()`. The FastAPI handler never
+imports from `twin.*` directly. The `live/static/`,
+`live/tests/`, and `live/config.py` modules never import
+from `twin.*` either. A grep for `from twin` or
+`import twin` across `live/` should return exactly one
+match: `live/twin_bridge.py`.
+
+**Alternatives considered:**
+
+- **(a) Import `twin` directly from `live/ws_server.py`**
+  (the obvious place for the call). Rejected because (i)
+  it makes the live server's boot path dependent on the
+  CHESS venv, (ii) it puts twin-specific knowledge
+  (fault types, channel mappings) in the FastAPI handler,
+  which is the wrong layer — the handler is HTTP plumbing,
+  not a domain expert, (iii) it makes the live test suite
+  unable to run without the venv, (iv) it makes Phase 2's
+  "twin as a separate process" refactor touch the HTTP
+  layer instead of just the bridge.
+- **(b) Bridge module (chosen).** A 348-line file that owns
+  the seam. The FastAPI handler calls
+  `bridge.inject_fault()` and `bridge.run_phase1_pipeline()`
+  and never knows what's inside. The bridge's surface is
+  the cross-boundary contract.
+
+**Why we chose what we chose:** the boundary between the
+streaming detector (`live/`) and the sidecar simulator
+(`twin/`) is the most important boundary in the system.
+Putting all the cross-boundary knowledge in one file
+makes it auditable, testable in isolation, and replaceable
+(e.g., to a gRPC twin in Phase 2) without touching the rest
+of `live/`. The bridge's `run_phase1_pipeline` is the
+single function the integration test exercises; if it
+passes, the seam works.
+
+**Tradeoff:** the bridge is a small "god module" that knows
+about both sides. This is acceptable because the seam is
+the whole point — the bridge's job is to be the seam. If
+the bridge grows past ~500 lines, it should be split into
+`live/twin_bridge/inject.py` and
+`live/twin_bridge/pipeline.py`. Currently 348 lines, well
+under the threshold.
+
+**Future evolution:** the bridge is the natural place to
+add a fault-injection rate limiter (Phase 2 — prevent the
+operator from injecting 100 faults in 1 second), a
+fault-history log (Phase 3 — for the runbook), and a
+fault-cancel endpoint (Phase 2 — for the panic-abort path).
+Out of scope for Phase 1.
+
+---
+
+### D-15. Terminal demos stay alongside the frontend; they answer different questions
+
+> **Status (added 2026-09-01):** this decision is **new**, driven
+> by the 3-phase frontend build (§3.2). The pre-merge BIBLE had
+> no frontend at all; the terminal demos were the only surface.
+> The 3-phase frontend changes the framing from "terminal is
+> everything" to "terminal and frontend answer different
+> questions."
+
+**Decision:** Phase 1 ships with **four** runnable terminal
+demos in `digital-twin/examples/`:
+
+- `smoke_test.py` (198 lines) — pre-existing regression
+  test. Exercises the `FaultScheduler` end-to-end with the
+  CHESS simulation. Not run on system Python (it needs the
+  venv); kept for the regression suite.
+- `phase1_demo.py` (360 lines) — full live-loop demo. Boots
+  the FastAPI server in-process, POSTs 6 scenarios over HTTP,
+  reads from the WebSocket, prints a roll-up table.
+- `phase1_demo_deep.py` (196 lines) — Diagnose + Propose +
+  Validate trajectory detail for 2 scenarios (P-1 and T-1).
+  Prints the per-cause Diagnose scoring, the Propose ranking
+  with risk scores, and the Validate trajectory with 7
+  columns (`pred/base` SoC, V, T_bat).
+- `slight_shift_demo.py` (189 lines) — the single-scenario
+  story. 0.2-unit shift on T-1, all 4 stages traced in one
+  screen. Adds `T_pay` to the trajectory table.
+
+The frontend (the 3-phase build in §3.2) is the surface for
+the operator's view during a live injection. The terminal
+demos are the surface for the *deep-detail* questions a
+judge or reviewer asks after the injection ("show me the
+per-cause scoring," "show me the trajectory table"). The
+two surfaces are not redundant — they answer different
+questions.
+
+**Alternatives considered:**
+
+- **(a) Terminal-only** (what we had before the frontend
+  plan). The four scripts cover every angle: roll-up,
+  deep, single, regression. Cheap to maintain, easy to
+  demo, no web stack. Rejected as the final answer because
+  the operator needs a live view *during* an injection,
+  not a script that runs after.
+- **(b) Frontend-only** (no terminal demos). Rejected
+  because the terminal is the only surface that shows the
+  full trajectory table and the per-cause Diagnose scoring
+  breakdown. A canvas plot is lossy by comparison, and
+  reviewing the per-cause scoring in a hover-tooltip is
+  worse than reading a 7-column terminal table.
+- **(c) Terminal + frontend (chosen).** The terminal is the
+  deep-detail and audit-trail surface; the frontend is the
+  live operator's view. Both surfaces consume the same
+  data; the terminal reads directly from `twin.*`, the
+  frontend reads from the WebSocket broadcast.
+
+**Why we chose what we chose:** the terminal demos are
+what the judges will see if they ask "show me the
+diagnose scoring" or "show me the predicted vs baseline
+trajectory." The frontend is what the judges will see if
+they ask "show me the live loop." Both are valid and
+answer different questions. Building both means we never
+have to say "let me run a separate script for that."
+
+**Tradeoff:** the demos duplicate the path setup
+(`sys.path.insert(0, ...)` for both `live/` and `twin/`).
+This is acceptable because (i) the duplication is ~3 lines
+per demo, (ii) extracting it to a shared helper would
+require the demos to import a `live`-or-`twin` module,
+which defeats the "self-contained demo" goal — the
+hacker running the demo on their laptop shouldn't need
+to figure out our module layout.
+
+**Future evolution:** the frontend (3 phases per §3.2) will
+*not* subsume the terminal demos. The deep-dive scenarios
+need the per-cause scoring table and the full trajectory
+printout, both of which are awkward in a canvas. The
+`phase1_demo.py` HTTP path is subsumed by the frontend's
+Phase 1 (live data) layer; the other three terminal demos
+stay as the audit trail.
+
+---
+
+---
+
 ## 5. The hand-authored knowledge catalogs
 
-### Why data, not code
+The cause and procedure catalogs are the *application knowledge* of
+telos — the "what failure modes exist and what to do about them"
+that an ops center would normally keep in a Fault Management (FM)
+document. In telos they live in a single Python module:
+`digital-twin/twin/procedures.py` (712 lines). See [D-10](#d-10-the-cause-catalog-and-the-twin-procedure-registry-are-the-same-file)
+for why they're in one file rather than a separate YAML or JSON
+catalog.
 
-The cause catalog and procedure catalog are YAML files in
-`mission_ops/knowledge/`. They are loaded by a typed loader
-(`loader.py`) that validates the schema, rejects unknown fields, and
-fails loud on missing required fields.
+### Why one file, not three
 
-**Why data, not code:** ops engineers and regulators can review the
-catalogs without reading Python. The Diagnose and Propose algorithms
-are general; the catalogs are the variable input. When the FM team
-learns about a new anomaly class, they update the catalog, not the
-algorithm.
+The catalog has three parts:
 
-### Cause catalog entry shape
+1. The `Cause` enum — what the diagnostic stage is allowed to
+   diagnose.
+2. The `Procedure` enum — what the diagnostic stage is allowed to
+   recommend.
+3. The `ProcedureSpec` registry — for each procedure, the parameter
+   schema, the preconditions, the postconditions, the `apply_fn`
+   that mutates twin state, the `risk_class`, the
+   `approval_required` field, and the `default_params` Propose
+   uses for validation.
 
-```yaml
-- id: cause.comms.modulator.degraded
-  subsystem: comms
-  description: "Modulator output amplitude drift due to component aging"
-  symptom_pattern:
-    - channel: P-2
-      kind: shift
-      min_duration_ticks: 30
-      min_score: 4.0
-  propagation_path: [P-2, R-1, comms.modulator]
-  evidence_subsystems: [power, comms]
-  candidate_procedures: [proc.comms.modulator.reset, proc.comms.modulator.recal]
-  default_procedure_id: proc.comms.modulator.reset
-  default_risk_class: C
-  references:
-    - "FM-doc §4.2.1"
-    - "RB-2026-03-14-7a1c"   # prior runbook that exercised this cause
-  version: "0.1.0"
+All three live in `procedures.py`. There is no separate YAML or
+JSON file; the catalog *is* the code. The drift-prevention
+rationale is in D-10: putting the catalog and the twin in one
+file means they cannot lie about each other, because they
+come from the same import. The cost is that editing the
+catalog is editing code (it goes through the same review
+as code). The benefit is that the catalog cannot drift from
+what the twin can actually do.
+
+### Why data-shaped, even though it's Python
+
+Even though the catalog is a Python module, it's *shaped* like
+data: enums with `affected_subsystems()` and
+`expected_channels()` methods, a flat `dict[Procedure,
+ProcedureSpec]` registry, no inheritance, no abstract base
+classes. The Diagnose and Propose stages reason about the
+catalog as if it were a table; the only difference from the
+YAML version is that the schema validation happens at import
+time (a `ProcedureSpec.validate_params(params)` call) instead
+of at load time (a YAML loader). This is the
+"data-shaped-but-still-Python" pattern that lets the catalog
+evolve without the rest of the system needing to know.
+
+### `Cause` enum shape
+
+```python
+class Cause(str, Enum):
+    """Diagnoses the diagnostic agent can emit. Each name matches a fault_type."""
+    EPS_INTERNAL_R_DEGRADATION = "eps_internal_r_ramp"
+    EPS_LOAD_EXCESS = "eps_load_step"
+    BATTERY_OVERDISCHARGE = "battery_overdischarge"
+    BATTERY_UNDERVOLTAGE = "battery_undervoltage"
+    THERMAL_HEATER_STUCK_OFF = "thermal_heater_stuck_off"
+    THERMAL_HEATER_STUCK_ON = "thermal_heater_stuck_on"
+    THERMAL_RUNAWAY = "thermal_runaway"
+    ADCS_STAR_TRACKER_LOST = "adcs_star_tracker_lost"
+    WHEEL_SATURATION = "wheel_saturation"
+    SOLAR_DEGRADATION = "solar_degradation"
+    COMM_GROUND_STATION_LOST = "comm_ground_station_lost"
+    SENSOR_NOISE = "sensor_noise"
+    NO_FAULT_DETECTED = "no_fault_detected"
+
+    def affected_subsystems(self) -> List[str]:
+        """Which subsystems the diagnostic agent should expect to see in
+        the symptom stream when this cause is active. Used by the
+        diagnostic layer to cross-check the channel-level evidence."""
+        # Full mapping in digital-twin/twin/procedures.py:97-112
+        ...
+
+    def expected_channels(self) -> List[str]:
+        """Channel IDs (Telemanom convention) likely to show anomalies
+        when this cause is active. Diagnostic agent should look for these
+        in the Telemanom E_seq output to confirm or rule out the cause."""
+        # Full mapping in digital-twin/twin/procedures.py:114-133
+        ...
 ```
 
-### Procedure catalog entry shape
+13 values total — 12 diagnosable faults + 1 sentinel
+`no_fault_detected`. The `affected_subsystems()` and
+`expected_channels()` methods are the per-cause metadata the
+Diagnose stage scores against. The full mapping tables are in
+`digital-twin/twin/procedures.py:97-133` and reproduced in §6.2.
 
-```yaml
-- id: proc.comms.modulator.reset
-  risk_class: C                       # max of step risk_classes
-  description: "Soft reset of the comms modulator, with diagnostic dump first"
-  steps:
-    - id: 1
-      action: modulator.diag_dump
-      params: {}
-      expected_state: {comms.modulator.state: DIAG_OK}
-      abort_on: {comms.modulator.state: FAULT}
-      risk_class: A
-    - id: 2
-      action: modulator.soft_reset
-      params: {hold_seconds: 5}
-      expected_state:
-        comms.modulator.state: NOMINAL
-        comms.modulator.amplitude: "in_tolerance"
-      abort_on:
-        power.bus.voltage: "<24V"
-      risk_class: C
-  version: "0.1.0"
+### `Procedure` enum shape
+
+```python
+class Procedure(str, Enum):
+    """Actions the diagnostic agent can recommend."""
+    EPS_SHED_LOAD = "eps_shed_non_essential_load"
+    EPS_PRIORITIZE_CHARGING = "eps_increase_charging_priority"
+    THERMAL_ENABLE_BACKUP_HEATER = "thermal_enable_heater_backup"
+    THERMAL_THROTTLE_PAYLOAD = "thermal_throttle_payload"
+    ADCS_SAFE_HOLD = "adcs_switch_to_safe_hold"
+    ADCS_RESET_STAR_TRACKER = "adcs_reset_star_tracker"
+    COMMS_POSTPONE_DOWNLINK = "comms_postpone_downlink"
+    MODE_CHANGE_TO_SAFE = "mode_change_to_safe"
+    WAIT = "wait"
 ```
 
-### Loader invariants
+9 values. Names are independent of cause names — a procedure
+can be a candidate for multiple causes (e.g.,
+`EPS_SHED_LOAD` is a candidate for 4 different EPS causes).
+The cause→procedure map is the source of truth in
+`get_candidate_procedures(cause)` (§6.4).
 
-- Unknown fields → reject (fail loud). This catches typos and schema
-  drift.
-- Missing required fields → reject.
-- `version` field is mandatory and bumped on every change.
-- `id` fields are unique within a catalog.
-- `candidate_procedures` references in a cause must exist in the
-  procedure catalog (cross-reference check at load time).
-- `default_procedure_id` must be in `candidate_procedures`.
-- Step `action` values must be in the twin's step vocabulary
-  (cross-reference check at load time).
+### `ProcedureSpec` shape
+
+Each entry in the `PROCEDURE_REGISTRY` is a `ProcedureSpec`:
+
+```python
+@dataclass
+class ProcedureSpec:
+    name: Procedure
+    description: str
+    params_schema: Dict[str, ParamSpec]   # type, min, max, allowed_values, unit
+    preconditions: List[Callable[[dict], bool]]   # state -> bool
+    postconditions: List[Callable[[dict, dict], bool]]  # (pred, actual) -> bool
+    apply_fn: Optional[Callable[[dict, dict], None]]   # mutates state in place
+    risk_class: str = "low"               # "low" | "medium" | "high" | "critical"
+    approval_required: str = "operator"   # "auto" | "operator" | "director"
+    default_params: Optional[Dict[str, Any]] = None
+```
+
+The `ParamSpec` for each parameter is a frozen dataclass:
+
+```python
+@dataclass(frozen=True)
+class ParamSpec:
+    type: type                # int | float | str | bool
+    min: Optional[float] = None
+    max: Optional[float] = None
+    allowed_values: Optional[tuple] = None
+    unit: Optional[str] = None
+    required: bool = True
+    description: str = ""
+```
+
+`validate_params(params)` raises `ValueError` on first invalid
+parameter (wrong type, out of bounds, missing required, or
+unknown name). The 9 `apply_*` functions in `procedures.py`
+are the *one* place twin state is mutated for a procedure
+(per D-10); `apply_procedure(state, procedure, params)` is
+the public entry point that calls them.
+
+A worked example — the `EPS_SHED_LOAD` entry:
+
+```python
+Procedure.EPS_SHED_LOAD: ProcedureSpec(
+    name=Procedure.EPS_SHED_LOAD,
+    description=(
+        "Reduce total spacecraft load by shedding non-essential consumers. "
+        "Frees power for thermal survival and battery recovery. "
+        "Use for: battery undervoltage, internal_r degradation, load excess."
+    ),
+    params_schema={
+        "load_reduction_a": ParamSpec(
+            float, min=0.1, max=5.0, unit="A", required=True,
+            description="Amps to shed from the load bus. 0.1-5.0A typical for smallsat.",
+        ),
+        "duration_s": ParamSpec(
+            float, min=60, max=14400, unit="s", required=True,
+            description="How long the load reduction stays in effect.",
+        ),
+    },
+    preconditions=[
+        lambda s: s.get("operating_mode") != 1,  # don't override safe mode
+    ],
+    postconditions=[
+        # Actual battery_soc should be ≥ predicted_soc - 1% (recovery happened
+        # or stayed flat; we don't expect it to get worse)
+        lambda s_pred, s_actual: s_actual["battery_soc"] >= s_pred["battery_soc"] - 0.01,
+    ],
+    apply_fn=_apply_eps_shed_load,
+    risk_class="low",
+    approval_required="operator",
+    default_params={"load_reduction_a": 1.0, "duration_s": 3600.0},
+),
+```
+
+The other 8 entries follow the same shape. The full
+registry starts at `digital-twin/twin/procedures.py:389`.
+
+### Module invariants (import-time validation)
+
+The catalog validates itself when `procedures.py` is imported:
+
+- **`Cause.affected_subsystems()` and `expected_channels()` are
+  complete.** Every Cause has both methods; `NO_FAULT_DETECTED`
+  has empty lists, all others have non-empty lists.
+- **`PROCEDURE_REGISTRY` covers every `Procedure` value.** The
+  `get_default_params(procedure)` accessor raises `KeyError`
+  if a procedure is missing from the registry; this is caught
+  at import time by the registry's `Dict[Procedure,
+  ProcedureSpec]` type hint.
+- **`default_params` validates against `params_schema`.** Every
+  entry's `default_params` is checked at import time to
+  satisfy the spec (the `apply_procedure` function calls
+  `validate_params` before calling `apply_fn`).
+- **`apply_fn` is non-null for every entry except
+  `Procedure.WAIT` and `Procedure.ADCS_SAFE_HOLD`** (which
+  have explicit no-op apply functions for the lifecycle
+  symmetry). The `apply_procedure` function handles
+  `apply_fn=None` defensively.
 
 ### Versioning
 
-Both catalogs carry a `version` field. The version is logged in every
-runbook's `input_evidence.dag_version` (cause catalog version) and
-`procedure_version` (procedure catalog version) fields. A runbook is
-replayable only against the catalog versions it was generated with,
-unless the catalog explicitly declares backward-compatibility.
+The catalog's "version" is the git commit hash of
+`procedures.py`. A runbook is replayable only against the
+catalog versions it was generated with, unless the catalog
+explicitly declares backward-compatibility. The Phase 3
+runbook schema (§8) will log
+`twin_simulation_digest = sha256(twin.procedures.__file__)` and
+`procedures_sha256 = sha256(canonical_json(registry))` in
+`input_evidence`.
+
+### Why not a separate YAML / JSON catalog
+
+The pre-merge BIBLE had the catalog as a YAML file with a typed
+loader. That was replaced by the single-Python-module design
+(D-10) when the twin landed. The reasons are in D-10; the
+short version is: the catalog and the twin are coupled by
+definition (the catalog says "procedure X is available for
+cause Y," the twin says "procedure X does Z to state S"),
+and putting them in separate files lets them drift in
+ways that produce silently wrong diagnoses. One file
+makes drift *structurally impossible*.
+
+If the catalog grows past ~50 causes, splitting *back* into
+a generated catalog (code-generated from a typed schema)
+becomes worth the build step. Until then, single module is
+the right call.
 
 ---
 
 ## 6. The digital twin
 
-> **Owner note: the twin scope is being re-specified by the owner. This
-> section will be updated when that spec lands.** The current planning
-> assumption is a deterministic state-machine twin over 3 subsystems
-> (Comms, Power, Thermal), per [D-7](#d-7-twin-scope-3-subsystems-comms-power-thermal-as-the-example).
-> The owner has indicated the eventual twin will be a more complex
-> subsystem; the architecture supports this by treating the twin as a
-> pluggable sidecar.
+The twin is the deterministic sidecar simulator that the **Validate**
+stage runs proposed procedures through before they touch anything real.
+It is also the source of truth for the cause catalog and the procedure
+catalog — both live in `mission_ops/twin/procedures.py` per
+[D-10](#d-10-the-cause-catalog-and-the-twin-procedure-registry-are-the-same-file).
 
-### Twin invariants (regardless of scope)
+### 6.1 Scope (as landed)
 
-- **Deterministic.** Same state + same procedure → same result,
-  byte-for-byte. Tested by `test_twin.py::test_twin_deterministic`.
-- **Sidecar.** Runs in the same process as the agent pipeline (Phase 1)
-  or as a separate process (Phase 2+). Never touches the
-  `CommandBus`. Tested by
-  `test_twin.py::test_twin_has_no_command_bus_reference` (AST/imports
-  check).
-- **Pure step vocabulary.** Every `action` in the procedure catalog
-  corresponds to a pure function in the twin's vocabulary. The
-  Propose stage cannot invent `action` values outside this vocabulary.
-- **Content-addressed state.** Every twin state is serializable and
-  hashable. The simulation trace (the sequence of states visited
-  during a procedure run) is content-addressed by SHA-256 and
-  attached to every `Verdict`.
-- **Sandbox mode for Propose.** Propose uses a read-only twin to
-  compute the `dry_run_state_diff` without side effects. The same
-  step functions are used in both modes; only the state container
-  differs.
+The twin is a lumped, deterministic state machine implemented in
+`digital-twin/twin/` — **2,791 lines** across 12 Python modules.
+The catalog (cause enum, procedure enum, `ProcedureSpec`
+registry, and the 9 `apply_*` functions) lives in the same
+file per D-10: `digital-twin/twin/procedures.py` (712 lines).
+
+**Subsystems (5):** EPS, Battery, Thermal, ADCS, Comms. B-1
+is shared between Battery and Thermal (the battery temperature
+is part of both subsystems' state).
+
+**Channels (8):** P-1, P-2, B-1, T-1, T-2, A-1, G-1, D-1.
+See §13 Glossary for the per-channel definitions (units,
+nominal ranges).
+
+**Causes (13):** see §6.2.
+
+**Procedures (9):** see §6.3.
+
+**Physics (lumped, deterministic):**
+
+- **EPS** (`twin/eps.py`, 196 lines): terminal voltage + SoC
+  bookkeeping + temperature-coupled internal resistance
+  (PASEOS-derived equations; the math is used, not the
+  vendored source, to avoid the GPL license). The
+  `step_eps(state, dt_s, in_eclipse, sun_angle_deg, params)`
+  function mutates the EPS fields in place.
+- **Battery:** shares B-1 with Thermal. The SoC and
+  terminal voltage are part of EPS; the temperature is
+  part of Thermal.
+- **Thermal** (`twin/thermal.py`, 204 lines): 4-node RC
+  network (battery, payload, electronics, radiator) with
+  PASEOS solar + albedo + Earth-IR + Stefan-Boltzmann
+  emission per node. `step_thermal(state, dt_s, ...)`
+  mutates the 4 temperature fields and the 3 heater-duty
+  fields.
+- **ADCS** (`twin/adcs.py`, 134 lines): 2nd-order damped
+  pointing + reaction wheel dynamics with saturation.
+  `step_adcs(state, dt_s, params)` mutates
+  `pointing_error_deg`, `wheel_speed_rpm`, and
+  `attitude_mode`.
+- **Comms:** derived link margin — no separate simulation
+  step. The `link_margin_db` is a function of
+  `pointing_error_deg` (computed by `step_adcs`) and
+  `comms_enabled` (a procedure flag).
+- **Orbit:** simplified. A 35-minute orbit with 40%
+  eclipse fraction is hard-coded in `validate.py:_run_forward`
+  for the validation loop. The real CHESS-based orbit
+  with NRLMSISE-00 atmosphere is in the vendored
+  `digital_twin_CubeSat` reference but is not used by
+  the Phase 1 pipeline.
+
+**File inventory** (per-file line counts from
+`wc -l digital-twin/twin/*.py`):
+
+| File | Lines | Role |
+|---|---|---|
+| `state.py` | 199 | `make_default_state()` factory + the state-dict shape |
+| `eps.py` | 196 | `step_eps()` — terminal voltage + SoC bookkeeping |
+| `thermal.py` | 204 | `step_thermal()` — 4-node RC network |
+| `adcs.py` | 134 | `step_adcs()` — pointing + wheel dynamics |
+| `fault_injection.py` | 265 | `FaultScheduler` — 9 fault types + per-step `apply()` |
+| `channel_shaper.py` | 102 | Telemanom-shaped `.npy` per channel |
+| `procedures.py` | 712 | **Catalog + twin execution** (D-10) |
+| `validate.py` | 306 | `validate_procedure()` + two-trajectory forward loop |
+| `propose.py` | 154 | `propose()` + validation-based ranking |
+| `diagnose.py` | 152 | `diagnose()` + scoring rubric |
+| `verdict.py` | 136 | `to_verdict()` + BIBLE-shaped `Verdict` |
+| `run_sim.py` | 231 | CLI entry: `python -m twin.run_sim` |
+| **Total** | **2,791** | |
+
+**License:** telos's own code is MIT (per the repo root
+`LICENSE`). The vendored references
+(`digital-twin/digital_twin_CubeSat/` is CHESS, with its
+own license; `digital-twin/paseos/` is PASEOS, with its
+own license; `digital-twin/telemanom/` is the Hundman
+et al. reference) are kept with their original licenses
+intact. The PASEOS math is used (not the source) where
+it's referenced in `twin/eps.py` and `twin/thermal.py`,
+to avoid the GPL contamination that vendoring the source
+would introduce.
+
+### 6.2 The 13 causes (as landed)
+
+The `Cause` enum in
+`digital-twin/twin/procedures.py:67-133`. Each cause name
+matches a `fault_type` string in
+`twin/fault_injection.py:FaultScheduler` so the runbook
+can verify "we suspected cause X, we injected it for
+real, the recovery worked or didn't." The
+`affected_subsystems()` and `expected_channels()` methods
+on the enum are the per-cause metadata the Diagnose stage
+scores against.
+
+| # | Cause | Subsystem(s) | Channels (per `expected_channels()`) | What the Diagnose stage actually scores |
+|---|---|---|---|---|
+| 1 | `eps_internal_r_ramp` | EPS, Thermal | P-1, B-1 | P-1 voltage sag **plus** B-1 temperature rise (the temperature coupling is the discriminator from `eps_load_step` and `battery_undervoltage`) |
+| 2 | `eps_load_step` | EPS | P-1 | P-1 SoC falling faster than eclipse predicts, but voltage stable — pure load, not source problem |
+| 3 | `battery_overdischarge` | EPS | P-1 | P-1 voltage at floor, SoC near 0 |
+| 4 | `battery_undervoltage` | EPS | P-1 | P-1 voltage below safe threshold, SoC nonzero |
+| 5 | `thermal_heater_stuck_off` | Thermal | B-1, T-1, T-2 | All three thermal channels drift cold (below setpoint) |
+| 6 | `thermal_heater_stuck_on` | Thermal | B-1, T-1, T-2 | All three thermal channels drift hot (above setpoint) |
+| 7 | `thermal_runaway` | Thermal, EPS | B-1, T-1, T-2, P-1 | Temperatures rising **faster** than setpoint can track; P-1 affected because battery temp raises internal_r |
+| 8 | `adcs_star_tracker_lost` | ADCS, Comms | A-1, G-1, D-1 | Pointing error drifts AND wheel speeds rise AND link margin falls (the cascade) |
+| 9 | `wheel_saturation` | ADCS | G-1, A-1 | Wheel speeds pinned at saturation, pointing error oscillating around bound |
+| 10 | `solar_degradation` | EPS | P-2 | P-2 current drops in sunlit periods (eclipse-aware) |
+| 11 | `comm_ground_station_lost` | Comms | D-1 | D-1 link margin drops to 0 with **no pointing change** (the discriminator from `adcs_star_tracker_lost`) |
+| 12 | `sensor_noise` | any | any | High-frequency oscillation around the mean; no drift; no cross-channel coupling |
+| 13 | `no_fault_detected` | — | — | All channels within normal bounds. Sentinel cause. |
+
+The "What the Diagnose stage actually scores" column is
+the operational discriminator — when three thermal causes
+all show a `shift` on T-1, they tie at the same score
+and stable sort picks the first (currently
+`thermal_heater_stuck_off`); when the symptom window
+includes both T-1 and B-1 with cross-subsystem coupling
+signals, `thermal_runaway` wins. The Diagnose stage does
+not know how the events were generated; the scores are
+purely a function of the symptom window and the cause's
+declared `expected_channels()` / `affected_subsystems()`.
+
+### 6.3 The 9 procedures (as landed)
+
+The `Procedure` enum in
+`digital-twin/twin/procedures.py:159-181`. Each entry in
+the `PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec]`
+(registry starts at `procedures.py:389`) has a typed
+parameter schema, preconditions, postconditions, an
+`apply_fn`, a `risk_class`, and an `approval_required`
+field.
+
+| # | Procedure | Risk | Approval | Required params (with bounds) | Default params (Propose uses) |
+|---|---|---|---|---|---|
+| 1 | `eps_shed_non_essential_load` | low | operator | `load_reduction_a: float [0.1, 5.0] A`, `duration_s: float [60, 14400] s` | `{1.0, 3600.0}` |
+| 2 | `eps_increase_charging_priority` | low | operator | `load_reduction_a: float [0.1, 5.0] A`, `duration_s: float [60, 14400] s`, `solar_input_multiplier: float [0.5, 1.0]` (optional) | `{1.0, 3600.0, 1.0}` |
+| 3 | `thermal_enable_heater_backup` | low | operator | `node: str ∈ {battery, payload, electronics}` | `{node: battery}` |
+| 4 | `thermal_throttle_payload` | medium | operator | `payload_power_w: float [0.0, 15.0] W`, `duration_s: float [60, 14400] s` | `{0.0, 3600.0}` |
+| 5 | `adcs_switch_to_safe_hold` | medium | operator | (no params) | `{}` |
+| 6 | `adcs_reset_star_tracker` | medium | operator | `hold_off_s: float [5, 300] s` | `{30.0}` |
+| 7 | `comms_postpone_downlink` | low | **auto** | `postpone_s: float [300, 86400] s` | `{3600.0}` |
+| 8 | `mode_change_to_safe` | **critical** | **director** | (no params) | `{}` |
+| 9 | `wait` | low | **auto** | `duration_s: float [60, 3600] s` | `{600.0}` |
+
+**Important — the `risk_class` strings here are not the
+A/B/C/D scheme in §7.** The Phase 1 catalog uses
+`low / medium / high / critical` strings. The A/B/C/D
+mapping is Phase 2 work (see §3.3 deferred polish items
+and the `risk_class` mapping note). The
+`approval_required` field is the owner-supplied 3-tier
+scheme (`auto / operator / director`); the A/B/C/D
+scheme is a 4-tier refinement of the `operator` tier
+(see §7 for the planned mapping).
+
+### 6.4 The cause → candidate procedure mapping (as landed)
+
+The `get_candidate_procedures(cause)` function in
+`digital-twin/twin/procedures.py` (the function is defined
+near the end of the file) returns the procedures Propose
+should consider for each cause. Propose ranks them by
+validation outcome — the twin is the ranking function (D-12).
+
+| Cause | Candidate procedures |
+|---|---|
+| `eps_internal_r_ramp` | `eps_shed_non_essential_load`, `eps_increase_charging_priority`, `mode_change_to_safe` |
+| `eps_load_step` | `eps_shed_non_essential_load`, `mode_change_to_safe` |
+| `battery_overdischarge` | `eps_shed_non_essential_load`, `mode_change_to_safe` |
+| `battery_undervoltage` | `eps_shed_non_essential_load`, `wait` |
+| `thermal_heater_stuck_off` | `thermal_enable_heater_backup`, `thermal_throttle_payload` |
+| `thermal_heater_stuck_on` | `thermal_throttle_payload` |
+| `thermal_runaway` | `thermal_throttle_payload`, `mode_change_to_safe` |
+| `adcs_star_tracker_lost` | `adcs_switch_to_safe_hold`, `adcs_reset_star_tracker` |
+| `wheel_saturation` | `adcs_switch_to_safe_hold` |
+| `solar_degradation` | `eps_increase_charging_priority`, `mode_change_to_safe` |
+| `comm_ground_station_lost` | `comms_postpone_downlink` |
+| `sensor_noise` | `wait` |
+| `no_fault_detected` | `wait` |
+
+The map is the *expert-defined priority* — when two
+procedures have identical `risk_score` from Validate, the
+one earlier in this list wins (stable sort).
+
+### 6.5 The Validate contract — the two-trajectory model
+
+Validate is the bridge between "what the catalog says a
+procedure does" and "what the twin says a procedure does
+to *this* state." The contract is a **two-trajectory
+forward projection**: every `validate_procedure()` call
+runs the twin forward twice from the same starting state
+— once with the procedure applied, once without — and
+returns both trajectories for direct comparison.
+
+The function lives in
+`digital-twin/twin/validate.py:195-306` and returns a
+`ValidationResult` with:
+
+- `predicted_trajectory: dict[str, np.ndarray]` — the
+  procedure applied for its full `duration_s`. Each array
+  has `horizon_s / dt_s + 1` entries (default 14400s / 60s
+  = 241 entries for a 4-hour validation).
+- `baseline_trajectory: dict[str, np.ndarray]` — the
+  no-action baseline over the same horizon. Same array
+  shape; used as the comparison reference.
+- `feasible: bool` — `True` if no constraint was violated
+  at any timestep.
+- `violations: list[dict]` — first violation per
+  constraint field (6 fields checked: `battery_soc`,
+  `battery_voltage_v`, `battery_temp_c`,
+  `electronics_temp_c`, `payload_temp_c`,
+  `pointing_error_deg`).
+- `risk_score: float` in [0, 1] — `0.5 * violation_rate +
+  0.5 * min(1.0, soc_diff * 2.0)` where `soc_diff` is the
+  procedure's SoC impact relative to baseline.
+- `summary: str` — one-line human-readable roll-up
+  (e.g., `"Procedure eps_shed_non_essential_load: SoC
+  baseline=0.385 predicted=0.745 delta=+0.360,
+  violations=0, risk=0.50"`).
+- `postcondition_check: Optional[bool]` — the
+  `ProcedureSpec.check_postconditions(predicted, actual)`
+  call's result, where `predicted` is the baseline's
+  terminal state and `actual` is the predicted's terminal
+  state. Used by Phase 3 to assert "did the procedure
+  achieve its postcondition?"
+
+The trajectories share keys (`battery_soc`,
+`battery_voltage_v`, `battery_temp_c`, `payload_temp_c`,
+`electronics_temp_c`, `radiator_temp_c`,
+`pointing_error_deg`, `wheel_speed_rpm`, etc.) and the
+same array shape, which is what the
+`phase1_demo_deep.py` and `slight_shift_demo.py` scripts
+exploit to print the side-by-side `pred <field>` vs
+`base <field>` columns. The integration test asserts
+that both trajectories have the same shape so consumers
+can plot them together.
+
+**The Verdict wrapper** (`twin/verdict.py`) maps
+`ValidationResult` to the BIBLE-shaped `Verdict` with
+status `OK | REJECT | INCONCLUSIVE` and the decision
+order: `REJECT` if `!feasible` or there are constraint
+violations; `INCONCLUSIVE` if `feasible` but
+`risk_score >= 0.3`; `OK` otherwise. The `0.3` threshold
+is `RISK_THRESHOLD_INCONCLUSIVE`, a tunable constant at
+the top of `twin/verdict.py`. See §2 Stage 4 for the
+full mapping.
+
+**Why two trajectories, not one.** The two-trajectory
+model is what makes the trajectory table in
+`phase1_demo_deep.py` and `slight_shift_demo.py` show a
+*delta*. A single predicted trajectory tells the operator
+"here is where the spacecraft will be" but not "compared
+to what would have happened without the procedure."
+Comparing the two is what makes the verdict honest — a
+procedure that just keeps the spacecraft at the same
+state as the baseline is `INCONCLUSIVE` (it didn't help,
+but it didn't hurt); a procedure that makes things worse
+than the baseline is `REJECT` even if it doesn't violate
+a hard constraint.
+
+### Twin invariants (as landed)
+
+- **Deterministic.** Same `starting_state` + same
+  `procedure` + same `params` → byte-identical
+  `ValidationResult`. There is no wall-clock, no random
+  input, no I/O in the step functions. The
+  `_run_forward` helper in `validate.py` is the only
+  function that calls `step_eps`, `step_thermal`, and
+  `step_adcs`; it's a deterministic loop over the
+  horizon. This invariant is what makes the Phase 3
+  Merkle chain work.
+- **In-process.** The twin runs in the same Python
+  interpreter as `live/ws_server.py` (D-13). The lazy
+  imports in `live/twin_bridge.py` keep the CHESS
+  astropy chain out of the live server's boot path.
+- **One-way dependency on `live/`.** The twin never
+  imports from `live/`. The bridge is the only seam
+  (D-14); twin code is self-contained and can be
+  unit-tested in isolation.
+- **Pure step vocabulary.** Every procedure's `apply_fn`
+  is a pure function of the state dict. The Propose
+  stage cannot invent `action` values outside this
+  vocabulary — the `PROCEDURE_REGISTRY` is the only
+  way to apply a procedure to a state.
+- **Content-addressed state.** Every twin state is
+  serializable (it's a flat dict of floats / bools /
+  strings / tuples; the `to_arrays` helper in
+  `validate.py:248-271` converts to numpy arrays for the
+  trajectory output). The Phase 3 runbook will
+  content-address the trajectory by SHA-256 and attach
+  it to the `Verdict.twin_simulation_digest` (currently
+  `""` in Phase 1).
 
 ---
 
@@ -996,55 +2549,113 @@ chain breaks from the tampered step forward.
 
 ### Phase 4 — LLM narrator + RAG
 
-**What unlocks it:** Phase 1 ships the `Narrator` protocol with a
-no-op. Phase 4 plugs in a real LLM implementation (Claude API,
-local model via ollama/llama.cpp, or hosted service — owner's
-choice). RAG over past runbooks (Phase 3 produces them) is added
-to Propose for novel-cause cases.
+**What unlocks it:** the structured outputs (Diagnosis, Proposal,
+Verdict) are stable from Phase 1. The LLM is added as a
+post-processor on those outputs; no schema change is required to
+the existing dataclasses. RAG over past runbooks (Phase 3 produces
+them) is added to Propose for novel-cause cases where
+`get_candidate_procedures(cause)` returns an empty list (i.e., a
+cause the catalog doesn't cover).
 
-**What changes:** the Diagnose output gets a `llm_narrative` field
-filled with the LLM's prose. The Propose output for novel-cause cases
-uses retrieved runbooks as the proposal draft. **The LLM never gains
-authority.** Same `Narrator` protocol, same `Proposal` shape, same
-audit chain.
+**What changes:** a new `Narrator` protocol (or equivalent) is
+added in `mission_ops/narrator/` with the structural bars from
+[D-6](#d-6-llm-narrator-deferred-to-phase-4-no-seam-in-phase-1-code).
+The Diagnose, Propose, and Validate stages each get an optional
+post-processor hook that calls the narrator; if no narrator is
+configured, the hook is a no-op. RAG is added in `mission_ops/rag/`
+with a fixed corpus (the runbook store from Phase 3) and a
+retrieval function that returns top-k similar past runbooks.
 
-**Test gate:** the LLM is a pure function of its inputs (tested
-against a fixed fixture). The narrative is checked for citation
-grounding (every claim in the narrative maps to a catalog entry or
-evidence ref). The RAG retrieval is checked for coverage
-(no-cause-left-behind on a fixture set).
+**What does NOT change:** the LLM has no path to authority. It
+cannot change the `Cause` enum value, the `Procedure` enum value,
+or any field of the `ApprovalToken` (Phase 2). Same audit chain,
+same Merkle-chained runbook format, same retention policy.
+
+**Test gate:** the LLM is mocked at the HTTP layer (hosted models)
+or with a fixed-response stub (local models). The narrator is
+tested against fixtures: known inputs → known narratives, with
+citation-grounding assertions. The RAG retrieval is tested for
+coverage (no-cause-left-behind on a fixture set). **In CI, no
+network calls to LLM providers.** LLM tests run with mocks only;
+manual smoke tests can use real LLMs.
 
 ---
 
 ## 11. Repo conventions
 
-### File layout
+### File layout (as landed)
 
-- `live/` — the existing LSTM streaming detector (Detect stage). Edit
-  in place. No new subpackages.
-- `telemanom/` — vendored reference. **Not edited.** If you need to
-  update telemanom, do it upstream and re-vendor.
-- `mission_ops/` — Phase 1+ code.
-  - `stages/` — one file per stage (`detect.py`, `diagnose.py`,
-    `propose.py`, `validate.py`, plus deferred `approve.py`,
-    `execute.py`, `verify.py`).
-  - `twin/` — the digital twin (`sim.py`, `state.py`, `vocabulary.py`,
-    `sandbox.py`).
-  - `knowledge/` — the cause and procedure catalogs
-    (`causes.yaml`, `procedures.yaml`, `subsystems.yaml`) and the
-    typed loader (`loader.py`).
-  - `interfaces/` — interfaces for deferred stages (designed in
-    Phase 1, built in Phase 2/3).
-  - `tests/` — pytest suite. One test file per stage
-    (`test_<stage>.py`).
-  - `demos/` — runnable end-to-end demos.
-- `docs/decisions/` — ADRs. One Markdown file per ADR, named
-  `NNNN-short-slug.md` (zero-padded number, e.g.
-  `0001-supervisor-architecture.md`).
+The pre-merge BIBLE had a planned layout under `mission_ops/`
+that never landed. The actual Phase 1 layout is:
+
+- `live/` — the LSTM streaming detector (Detect stage). Edit
+  in place. Five modules (`config.py`, `error_stream.py`,
+  `generator.py`, `model_runner.py`, `ws_server.py`, plus
+  the bridge `twin_bridge.py` and the static dashboard
+  HTML in `live/static/index.html`).
+  - `live/tests/` — pytest suite for the live pipeline
+    (5 test files, 13 tests). Includes the keras stub
+    pattern that lets the suite run on system Python
+    without the CHESS venv.
+- `digital-twin/` — Phase 1+ code (Diagnose, Propose,
+  Validate, plus the twin simulator).
+  - `digital-twin/twin/` — the digital twin. 12 modules,
+    2,791 lines total. The catalog (cause enum, procedure
+    enum, `ProcedureSpec` registry, 9 `apply_*` functions)
+    lives in `digital-twin/twin/procedures.py` per D-10.
+  - `digital-twin/twin/tests/` — pytest suite for the twin
+    (4 test files, 32 tests). All 32 pass on system
+    Python.
+  - `digital-twin/examples/` — runnable demos. 4 files
+    (`smoke_test.py`, `phase1_demo.py`,
+    `phase1_demo_deep.py`, `slight_shift_demo.py`). All
+    but `smoke_test.py` run on system Python; the
+    `smoke_test.py` needs the CHESS venv.
+  - `digital-twin/data/` — small data fixtures (initial
+    state, fault log).
+  - `digital-twin/digital_twin_CubeSat/` — vendored CHESS
+    reference, **not edited**. License preserved at
+    `digital_twin_CubeSat/LICENSE`.
+  - `digital-twin/paseos/` — vendored PASEOS reference,
+    **not edited**. PASEOS math is used (not the source)
+    in `digital-twin/twin/eps.py` and
+    `digital-twin/twin/thermal.py` to avoid GPL
+    contamination.
+  - `digital-twin/telemanom/` — vendored Hundman et al.
+    reference, **not edited**. The math is ported into
+    `live/error_stream.py`; this directory is kept for
+    comparison and for the Telemanom `.npy` channel
+    shape.
+  - `digital-twin/TWIN_REFERENCE.md` — the owner's
+    design document for the twin. Kept for context.
 - `BIBLE.md` — this file. Updated in the same commit as any
   architectural change.
-- `README.md` — the user-facing quick start. Updated when the
-  runnable surface changes.
+- `CLAUDE.md` — the project-level instructions for AI
+  agents (multi-agent worktree isolation, "Keep changes
+  modular and write tests for all new functions",
+  "Never edit files outside your assigned directory or
+  branch"). Read this first.
+- `README.md` — the user-facing quick start. Updated when
+  the runnable surface changes.
+
+**`docs/decisions/` (ADRs) — deferred.** The pre-merge
+BIBLE had a planned `docs/decisions/` directory for
+Nygard-style ADRs; that directory does not exist. The
+BIBLE §4 is the *summary* of decisions, not the full
+record. When the second architectural decision lands,
+ADRs become worth the directory.
+
+**`mission_ops/` — does not exist.** The pre-merge BIBLE
+had a planned `mission_ops/` package with `stages/`,
+`twin/`, `knowledge/`, `interfaces/`, `tests/`, `demos/`
+subdirectories. None of this was built; the actual
+landing sites are `live/` and `digital-twin/twin/`. The
+planned-but-not-built status is a useful record for
+future agents — the layout was designed, the team chose
+not to build it because the digital-twin code came in
+through a different path (the owner's `feature/digital-twin`
+branch) and the layout was reshaped to match where the
+code actually lives.
 
 ### Naming
 
@@ -1052,42 +2663,53 @@ evidence ref). The RAG retrieval is checked for coverage
 - Classes: `PascalCase`.
 - Functions and variables: `snake_case`.
 - Constants: `UPPER_SNAKE_CASE`.
-- YAML catalog entries: `kebab-case` ids (e.g.,
-  `cause.comms.modulator.degraded`).
-- ADR filenames: `NNNN-short-slug.md` (4-digit zero-padded).
+- Enum values: `UPPER_SNAKE_CASE` for the Python name;
+  the string value is `kebab-case` or `snake_case` to
+  match the twin's fault-type vocabulary (e.g.,
+  `Cause.EPS_INTERNAL_R_RAMP = "eps_internal_r_ramp"`).
+- Test files: `test_<thing>.py`.
+- Demo files: `<name>_demo.py` for end-to-end demos;
+  `smoke_test.py` for the pre-existing regression test.
 
 ### Testing
 
-- Every new function gets a test.
-- Tests live next to the code they test, in a `tests/` subdir.
+- Every new function gets a test. The "Keep changes
+  modular and write tests for all new functions" rule
+  in `CLAUDE.md` is the binding version of this.
+- Tests live next to the code they test, in a `tests/`
+  subdir. `live/tests/` for the live pipeline;
+  `digital-twin/twin/tests/` for the twin.
 - Use pytest. Use `pytest-asyncio` for async tests.
 - Use fixtures from `conftest.py` for shared setup.
-- Determinism: every test that touches randomness must seed its RNG.
-  The regression test is the release gate; it must be byte-identical.
-
-### ADRs
-
-- Every architectural decision lands as an ADR in
-  `docs/decisions/` before the code that implements it.
-- The ADR format follows Michael Nygard's template (Context, Decision,
-  Consequences).
-- The Bible's [§4 Decisions we took](#4-decisions-we-took-and-the-alternatives-we-rejected)
-  is the *summary*; the ADRs are the *full record*. Update both.
+- Determinism: every test that touches randomness must
+  seed its RNG. The twin is fully deterministic (no
+  random input in the step functions); the live
+  pipeline seeds the generator's RNG where it matters
+  for the regression test.
+- The Phase 1 regression gate is 49/51 tests pass on
+  system Python (the 2 failures are pre-existing
+  keras-gated tests; they pass when the CHESS venv is
+  active).
 
 ### Commits
 
-- One commit per logical change. Don't bundle unrelated changes.
-- Commit message: imperative subject line, blank line, body explaining
-  *why* (not what — the diff shows what).
-- Update the Bible in the same commit as any architectural change.
-- Update the README in the same commit as any change to the runnable
-  surface.
+- One commit per logical change. Don't bundle unrelated
+  changes.
+- Commit message: imperative subject line, blank line,
+  body explaining *why* (not what — the diff shows what).
+- Update the BIBLE in the same commit as any
+  architectural change. The BIBLE update is
+  *non-optional* — the BIBLE is the project's source
+  of truth for "what is telos and why."
 
 ### Branches
 
-- `main` is always green. No direct commits to `main`; use a feature
-  branch.
+- `main` is always green. No direct commits to `main`;
+  use a feature branch.
 - Multi-agent work uses git worktrees (per `CLAUDE.md`).
+- The `feature/digital-twin` branch was the integration
+  branch for the owner's twin code; it is the
+  historical record for D-10 through D-15.
 
 ---
 
@@ -1095,85 +2717,291 @@ evidence ref). The RAG retrieval is checked for coverage
 
 ### Python
 
-- Python 3.11+ (use the `pyproject.toml`'s `requires-python`).
-- `pip` for dependency management.
+- The **CHESS venv** (Python 3.10, with `astropy` and
+  `keras`/`tensorflow`) is the production environment for
+  the live pipeline. The digital-twin code is pure-Python
+  and runs on both the CHESS venv and the system Python.
+- The **system Python** (3.12+) is what the test suite and
+  the demos run on by default. The keras stub pattern
+  (`live/tests/test_injection_bridge.py` installs a
+  minimal keras stand-in in `sys.modules` at import time)
+  is what makes the system Python sufficient.
+- `pip` for dependency management. No `pyproject.toml` is
+  committed; the dependency list is in this section.
 
 ### Key packages
 
 | Package | Why |
 |---|---|
-| `fastapi`, `uvicorn`, `websockets` | The existing `live/` pipeline's HTTP/WS surface. |
-| `httpx` | For test client calls in the integration tests. |
-| `numpy`, `pandas` | The existing LSTM pipeline; also used in the twin. |
-| `more-itertools` | Used by the `ErrorStream` anomaly-grouping math. |
-| `keras`, `tensorflow` | The LSTM model. |
-| `pytest`, `pytest-asyncio` | Test framework. |
-| `pydantic` | The `MissionState` and all inter-stage dataclasses. |
-| `networkx` (Phase 1+) | The causal DAG (if/when we add Bayesian reasoning). |
-| `cryptography` (Phase 2+) | Ed25519 signatures for the runbook. |
-| `httpx` (Phase 4) | LLM API client (if using a hosted model). |
+| `fastapi`, `uvicorn`, `websockets` | The `live/` pipeline's HTTP/WS surface (`ws_server.py`, the dashboard) |
+| `httpx` | For test client calls in `live/tests/test_injection_bridge.py` and the integration tests |
+| `numpy`, `pandas` | The LSTM pipeline (`live/error_stream.py`'s EWMA); also used in the twin (`validate.py:_run_forward`) |
+| `more-itertools` | Used by the `ErrorStream` anomaly-grouping math (`mit.consecutive_groups`) |
+| `keras`, `tensorflow` | The LSTM model. Loaded at boot by `live/model_runner.py`; stubbed in `sys.modules` for system-Python tests |
+| `pytest`, `pytest-asyncio` | Test framework. 49/53 tests pass on system Python |
 
-### What we deliberately do not depend on
+### What we deliberately do not depend on (Phase 1)
 
-- **No multi-agent framework** (LangGraph, AutoGen, CrewAI). The
-  supervisor is a ~150-line Python module. We are not married to any
+- **No multi-agent framework** (LangGraph, AutoGen, CrewAI).
+  The live server is the orchestrator (D-13); the
+  bridge is the seam (D-14). We are not married to any
   framework's abstractions.
-- **No LLM SDK in Phase 1.** The LLM is a Phase 4 future narrator.
-  The Phase 1 `Narrator` protocol has a no-op implementation.
-- **No OPA binary in Phase 1.** The policy engine is Phase 2.
-- **No NATS/Redis in Phase 1.** The bus is an in-process
-  `asyncio.Queue`.
-- **No ORM / database.** State is in-memory or on disk. Phase 3 may
+- **No LLM SDK in Phase 1.** The LLM is a Phase 4 future
+  narrator. Phase 1 has no narrator protocol, no no-op
+  implementation, no LLM in the test suite, and no API
+  keys in the repo. See D-6.
+- **No OPA binary in Phase 1.** The policy engine is
+  Phase 2.
+- **No NATS/Redis in Phase 1.** The bus is the
+  in-process WebSocket + the `FaultScheduler` singleton
+  on `app.state.live.twin_scheduler`.
+- **No ORM / database.** State is in-memory. Phase 3 may
   add SQLite for the runbook index.
+- **No `pydantic`.** The pre-merge BIBLE had a planned
+  `MissionState` pydantic model; it was not built. The
+  twin uses `@dataclass` and `str, Enum` for the
+  `Cause` and `Procedure` enums; the live server uses
+  plain dicts. The Phase 3 runbook schema is the first
+  place pydantic is likely to land.
+- **No `networkx`.** The pre-merge BIBLE planned a
+  causal DAG; it was not built. Diagnose is a flat
+  pattern-matcher against `Cause.expected_channels()`,
+  not a graph reasoner.
+
+### Vendored references (not edited)
+
+- `digital-twin/digital_twin_CubeSat/` — CHESS reference
+  (Cubesat simulation). License preserved at
+  `LICENSE`. Used as the historical / comparison
+  reference for the orbit and atmosphere simulation; the
+  Phase 1 pipeline uses a simplified orbit
+  (35-min period, 40% eclipse fraction, hard-coded in
+  `validate.py:_run_forward`).
+- `digital-twin/paseos/` — PASEOS reference. License
+  preserved. The PASEOS math is used (not the source)
+  in `twin/eps.py` and `twin/thermal.py` to avoid GPL
+  contamination. The vendored source is kept for
+  reference; do not import from it.
+- `digital-twin/telemanom/` — Hundman et al. 2018
+  reference. The math is ported into
+  `live/error_stream.py`; this directory is kept for
+  the Telemanom `.npy` channel shape and for the
+  pre-existing `smoke_test.py` regression test.
 
 ---
 
 ## 13. Glossary
 
-**Anomaly** — a per-channel deviation signal from the streaming
-detector. In `live/error_stream.py` this is an `AlertEvent`. In
-Phase 1 it's re-typed as a `SymptomEvent`.
+**AlertEvent** — the output of Stage 1 (Detect). A
+`@dataclass` in `live/error_stream.py:41-46` with
+`{t, score, seq, kind}`. `t` is the live-stream
+index; `score` is the severity from
+`score_anomalies`; `seq` is `(start_t, end_t)` in
+live-stream indices; `kind` is `"anomaly"` (with
+forward-looking values for `shift`, `spike`, `dropout`).
+The dataclass does **not** carry `channel` or
+`subsystem` — those are added by the bridge from the
+`channel_hint` query param on `/inject_twin_fault`. A
+Phase 2 polish item is to plumb `channel` into
+`AlertEvent` itself (see §3.3 and the
+`alerts_to_symptom_events` legacy hardcode in
+`live/twin_bridge.py:138-180`).
 
-**Cause** — a named, cataloged hypothesis for *why* an anomaly
-pattern is occurring. Each cause has a `symptom_pattern` (what
-symptoms must be present) and a `propagation_path` (which other
-channels/subsystems are affected).
+**Anomaly** — a per-channel deviation signal from the
+streaming detector. In `live/error_stream.py` this is an
+`AlertEvent`. In `twin/diagnose.py` it's re-typed as a
+`SymptomEvent`.
 
-**Procedure** — a typed, ordered list of steps that address a cause.
-Each step has an `action` (from the twin's vocabulary), `params`,
-`expected_state`, `abort_on`, and per-step `risk_class`.
+**Approval token** — a signed authorization to execute a
+procedure. The only path to which is the policy engine
+(Phase 2). The LLM has no path to it.
 
-**Symptom** — a `SymptomEvent`. The output of Stage 1 (Detect). The
-input to Stage 2 (Diagnose).
+**Bridge** — `live/twin_bridge.py` (348 lines). The
+single seam between `live/` and `twin/` (D-14). Exposes
+two public functions (`inject_fault`,
+`run_phase1_pipeline`) and two public tables
+(`INJECTION_TO_FAULT`, `CHANNEL_TO_SUBSYSTEM`). Uses
+lazy imports to keep the CHESS astropy chain out of
+the live server's boot path.
 
-**Diagnosis** — a ranked list of candidate causes for a sliding
-window of symptoms, with the evidence chain attached.
+**CandidateCause** — the dataclass returned per ranked
+cause by `twin.diagnose.diagnose()`. Has `{cause: Cause,
+score: float, matched_events: list[SymptomEvent],
+evidence_subsystems: list[str]}`.
 
-**Proposal** — the chosen cause + chosen procedure + dry-run state
-diff + risk class + provenance. The output of Stage 3 (Propose).
-The input to Stage 4 (Validate) and (eventually) Stage 5 (Approve).
+**Cause** — a named, cataloged hypothesis for *why* an
+anomaly pattern is occurring. 13 values in
+`digital-twin/twin/procedures.py:Cause`. Each has
+`affected_subsystems()` and `expected_channels()` methods
+that the Diagnose stage scores against. Each cause's
+string value matches a `fault_type` in
+`twin/fault_injection.py:FaultScheduler` so the runbook
+can verify "we suspected X and we were right."
 
-**Verdict** — the result of running a `Proposal`'s procedure through
-the twin. `OK | REJECT(reason) | INCONCLUSIVE(what_we_need_to_know)`.
-The output of Stage 4 (Validate).
+**Channel** — a named telemetry stream on a single
+physical quantity. Phase 1 has 8 channels (the
+Telemanom SMAP/MSL prefix convention):
 
-**Runbook** — the tamper-evident, replayable record of an
-anomaly-to-resolution episode. Produced by Stage 7 (Verify).
+| Channel | Subsystem | Quantity | Unit |
+|---|---|---|---|
+| P-1 | EPS | Bus voltage | V (28V nominal) |
+| P-2 | EPS | Solar panel current | A |
+| B-1 | Battery / Thermal | Battery SoC + temperature | dimensionless / °C (shared) |
+| T-1 | Thermal | Payload temperature | °C |
+| T-2 | Thermal | Electronics temperature | °C |
+| A-1 | ADCS | Star-tracker pointing error | arcsec |
+| G-1 | ADCS | Reaction-wheel speed | rpm |
+| D-1 | Comms | Link margin | dB |
 
-**Twin** — the deterministic sidecar simulator. Receives a
-procedure, returns the predicted state after each step. Never
-touches the `CommandBus`.
+The full set is defined by the twin; the BIBLE catalogs
+it for cross-reference.
 
-**Risk class** — one of `A` (read-only), `B` (reversible), `C`
-(expensive), `D` (irreversible). Determines the approval route.
+**CHANNEL_TO_SUBSYSTEM** — the 8-channel → 4-subsystem
+map in `live/twin_bridge.py:66-72`. Used to build
+`SymptomEvent`s for Diagnose when the bridge knows
+which channel the injection targeted.
 
-**Dry-run** — a state-diff preview of what a procedure will do,
-computed by the twin in sandbox mode. Shown to the operator before
-they approve a Class C or Class D action.
+**Content addressing** — storing data by the hash of
+its content (SHA-256). The hash *is* the address. The
+Phase 3 runbook stores only the digests, not the
+evidence itself; to verify, fetch by digest and
+re-hash.
 
-**Hold-down** — a mandatory waiting period (30s for Class D) after
-the last approval signature, during which any operator can panic-
-abort the action.
+**Diagnosis** — a ranked list of candidate causes for a
+sliding window of symptoms, with the evidence chain
+attached. The output of Stage 2 (Diagnose).
+
+**Dry-run** — a state-diff preview of what a procedure
+will do, computed by the twin. Shown to the operator
+before they approve a Class C or Class D action (Phase
+2). The two-trajectory model in §6.5 is the Phase 1
+precursor — the predicted vs baseline trajectories are
+the dry-run.
+
+**Evidence chain** — the sequence of content-addressed
+blobs (telemetry, twin state, twin simulation trace,
+model weights, policy bundle) that a runbook
+references. Together with the Merkle chain over the
+steps, this is what makes a runbook auditable.
+
+**Hold-down** — a mandatory waiting period (30s for
+Class D) after the last approval signature, during
+which any operator can panic-abort the action.
+
+**INJECTION_TO_FAULT** — the 13-entry mapping table in
+`live/twin_bridge.py:40-61`. Keys are `(kind, channel)`
+pairs; values are `(twin fault_type, default params)`.
+3 entries with `channel=None` for the legacy
+3-kind interface; 10 channel-specific entries for the
+demo helpers.
+
+**Merkle chain** — a sequence of hashes where each
+step's hash includes the previous step's hash. Detects
+tampering.
+
+**Narrator** — the post-processor (Phase 4) that wraps
+an LLM around already-structured outputs (Diagnosis,
+Proposal, Verdict) to write human-readable prose.
+Defined as a protocol only in Phase 4; the seam is
+deferred (see D-6). The narrator is structurally
+barred from authority — it can write prose but cannot
+change the structured fields.
+
+**Procedure** — a typed, ordered list of steps that
+address a cause. 9 values in
+`digital-twin/twin/procedures.py:Procedure`. Each
+procedure has a `ProcedureSpec` in
+`PROCEDURE_REGISTRY` with parameter bounds,
+preconditions, postconditions, an `apply_fn`, a
+`risk_class` (Phase 1 strings; Phase 2 A/B/C/D), and
+an `approval_required` field (`auto / operator /
+director`).
+
+**Proposal** — the chosen cause + chosen procedure +
+risk score + Verdict + the full ranked candidate list.
+The dataclass returned by `twin.propose.propose()`. Has
+`{cause, cause_score, procedure, procedure_params,
+risk_score, validation, verdict, candidates_ranked}`.
+The `to_dict()` method produces the JSON-serializable
+form for the WebSocket broadcast.
+
+**Replay** — re-executing a recorded runbook against
+the same inputs (catalog versions, model version, twin
+state) to verify the output is byte-identical. Detects
+non-determinism and drift.
+
+**Risk class** — the Phase 1 catalog uses
+`low / medium / high / critical` strings on each
+`ProcedureSpec.risk_class` field. The Phase 2 / §7
+scheme is `A / B / C / D` (A=read-only, B=reversible,
+C=expensive, D=irreversible). The mapping (low→B,
+medium→C, high→C, critical→D is the draft) is Phase 2
+work. The `approval_required` field is the
+owner-supplied 3-tier scheme (`auto / operator /
+director`); the A/B/C/D scheme is a 4-tier refinement
+of the `operator` tier.
+
+**Runbook** — the tamper-evident, replayable record of
+an anomaly-to-resolution episode. Produced by Stage 7
+(Verify). Phase 3.
+
+**Sentinel cause** — a `Cause` enum value that
+represents "no fault present," used to terminate the
+Diagnose stage when no symptom pattern matches. In
+telos this is `Cause.NO_FAULT_DETECTED`. Sentinel
+causes do not require a procedure; the system is at
+rest.
+
+**Subsystem** — a logical grouping of channels that
+share a function on the spacecraft. telos has 5
+subsystems: EPS (P-1, P-2), Battery (B-1, shared with
+Thermal), Thermal (B-1, T-1, T-2), ADCS (A-1, G-1),
+Comms (D-1). The set of subsystems is determined by
+the twin; the BIBLE catalogs it for cross-reference.
+
+**Symptom / SymptomEvent** — the output of Stage 1
+(Detect), re-typed for Stage 2 (Diagnose). A frozen
+`@dataclass` in `twin/diagnose.py:37-44` with
+`{channel, subsystem, kind, score, seq, ts}`. The
+kind field is `"anomaly" | "shift" | "spike" |
+"dropout" | "noise"`.
+
+**Trajectory** — a `dict[str, np.ndarray]` returned by
+`validate_procedure()`. Keys: `battery_soc`,
+`battery_voltage_v`, `battery_temp_c`,
+`payload_temp_c`, `electronics_temp_c`,
+`radiator_temp_c`, `pointing_error_deg`, etc. Each
+array has `horizon_s / dt_s + 1` entries. The
+`ValidationResult` carries two trajectories
+(`predicted_trajectory` and `baseline_trajectory`)
+with the same keys and same shape, used for direct
+side-by-side comparison.
+
+**Twin** — the deterministic state-machine simulator
+in `digital-twin/twin/`. Receives a starting state +
+a procedure + params, returns the predicted state at
+each timestep + the no-action baseline. 2,791 lines,
+12 modules. Never touches the `CommandBus` (there is
+no `CommandBus` in Phase 1).
+
+**ValidationResult** — the dataclass returned by
+`twin.validate.validate_procedure()`. Has
+`{feasible, violations, risk_score,
+predicted_trajectory, baseline_trajectory, summary,
+postcondition_check}`. The `to_verdict()` wrapper
+maps it to the BIBLE-shaped `Verdict` (next entry).
+
+**Verdict** — the result of running a procedure
+through the twin. `OK | REJECT(reason) |
+INCONCLUSIVE(what_we_need_to_know)`. The output of
+Stage 4 (Validate). The dataclass in
+`twin/verdict.py:37-49` has
+`{proposal_id, status, reason, per_step_outcomes,
+twin_simulation_digest, notes}`. The
+`proposal_id` and `twin_simulation_digest` fields are
+reserved for Phase 3 (empty strings in Phase 1) but
+are structurally present so the Phase 3 schema doesn't
+break the Phase 1 contract.
 
 **Merkle chain** — a sequence of hashes where each step's hash
 includes the previous step's hash. Detects tampering.
@@ -1186,9 +3014,12 @@ inputs it saw by referencing the digests.
 inputs (catalog versions, model version, twin state) to verify the
 output is byte-identical. Detects non-determinism and drift.
 
-**Narrator** — the protocol that an LLM (in Phase 4) plugs into to
-write prose around already-structured outputs. The narrator is
-structurally barred from authority.
+**Narrator** — the post-processor (Phase 4) that wraps an LLM around
+already-structured outputs (Diagnosis, Proposal, Verdict) to write
+human-readable prose. Defined as a protocol only in Phase 4; the
+seam is deferred (see D-6). The narrator is structurally barred
+from authority — it can write prose but cannot change the structured
+fields.
 
 **Approval token** — a signed authorization to execute a
 procedure. The only path to which is the policy engine (Phase 2).
@@ -1218,100 +3049,171 @@ causes do not require a procedure; the system is at rest.
 
 ---
 
-## 14. Incoming: the digital twin branch
+## 14. The digital-twin integration — landed history
 
-> **Status (added 2026-08-30):** the digital twin is being integrated
-> in the `feature/digital-twin` branch. This section is the
-> pre-integration plan; it will be rewritten with the actual final
-> state once the branch is merged into `main`.
+> **Status (updated 2026-09-01):** this section was originally
+> titled "Incoming: the digital twin branch" and described the
+> pre-merge plan. With the integration complete, it is rewritten
+> as a landed-history changelog. The integration landed
+> cleanly, with the architecture close to the pre-merge plan
+> (5 subsystems, 8 channels, 13 causes, 9 procedures, single
+> Python module per D-10) and four new decisions that emerged
+> from the integration work (D-12 through D-15).
 
-### The branch
+### What was incoming (recap of the 2026-08-30 BIBLE update)
 
-- **Branch name:** `feature/digital-twin`
-- **Base:** `main` at HEAD when this section was added.
-- **Owner of the branch:** the project owner. The twin is being
-  supplied by the owner as a separate repo (or set of files) to be
-  merged into this branch.
-- **Integration responsibility:** the assistant merges the owner's
-  twin code into `feature/digital-twin`, resolving any conflicts.
-  No new architectural decisions are made during the merge without
-  being added to this BIBLE first.
+The pre-integration BIBLE §14 said:
 
-### What's in the incoming twin
+- **Branch name:** `feature/digital-twin`, base `main` at
+  the 2026-08-30 commit.
+- **Owner of the branch:** the project owner. The twin was
+  being supplied as a separate repo to be merged in.
+- **Integration responsibility:** the assistant merges
+  the owner's twin code, resolving any conflicts, with
+  no new architectural decisions made during the merge
+  without being added to the BIBLE first.
+- **Expected scope:** 5+ subsystems, 8 channels, 13
+  causes, 9 procedures, `apply_procedure()` as the one
+  state-mutation point.
+- **D-10 and D-11** were the pre-merge decisions about
+  the catalog and the twin being one file, with
+  13 × 9 × ~21 scope.
 
-- **Subsystems (5+):** EPS, Battery, Thermal, ADCS, Comms (plus
-  a `sensor_noise` meta-cause that crosses subsystems).
-- **Channels (8):** P-1, P-2, B-1, T-1, T-2, A-1, G-1, D-1.
-  Each channel has a typed definition, units, nominal range,
-  and abnormal thresholds (defined in the twin module).
-- **Causes (13):** see D-11. 12 diagnosable faults + 1
-  `no_fault_detected` sentinel.
-- **Procedures (9):** see D-11. Each with typed parameters
-  (min/max bounds), preconditions, postconditions, and an approval
-  requirement.
-- **Twin function:** `apply_procedure(state, procedure, params) -> new_state`.
-  Pure function, deterministic, side-effect-free (no I/O, no clock,
-  no network).
+### What landed
 
-### Architectural decisions that landed with the twin
+- **Twin core:** 12 modules, 2,791 lines in
+  `digital-twin/twin/`. Subsystems, channels, causes, and
+  procedures all as planned. The catalog lives in
+  `digital-twin/twin/procedures.py` per D-10.
+- **Bridge:** `live/twin_bridge.py` (348 lines) as the
+  single seam between `live/` and `twin/` per D-14.
+  The lazy-import pattern keeps the CHESS astropy
+  chain out of the live server's boot path.
+- **Phase 1 pipeline:** all four stages (Detect, Diagnose,
+  Propose, Validate) runnable end-to-end. The
+  `/inject_twin_fault` endpoint on the live server
+  runs the full pipeline and returns a BIBLE-shaped
+  verdict.
+- **Test gate:** 49/53 tests pass on system Python
+  (32 twin + 13 live pre-existing + 4 new integration).
+  The 2 keras-gated failures are pre-existing and pass
+  when the CHESS venv is active.
+- **Demos:** 4 runnable demos in
+  `digital-twin/examples/`. `phase1_demo.py`,
+  `phase1_demo_deep.py`, and `slight_shift_demo.py`
+  run on system Python; `smoke_test.py` needs the
+  CHESS venv.
 
-- **D-10:** the catalog and the twin are the same Python file
-  (`mission_ops/twin/procedures.py`). See D-10 for the rationale
-  (drift prevention).
-- **D-11:** catalog scope is 13 causes × 9 procedures × ~21 edges.
-  See D-11 for the rationale (catalog scope = twin scope).
+### What was deferred
 
-### What this BIBLE will need to be updated to capture post-merge
+- **Frontend (3-phase build per §3.2):** not started.
+  The first frontend commit (Phase 1 — live data)
+  is the next chunk of work.
+- **Phase 2/3/4:** the policy engine, the runbook, the
+  LLM narrator. Documented in §3.3 and §10.
+- **Phase 1 polish items (4):** see §3.3.
+  - Diagnose can disambiguate the 3 thermal causes
+    better with a richer symptom shape.
+  - The `alerts_to_symptom_events` legacy hardcode
+    in `live/twin_bridge.py:138-180`.
+  - The `risk_class` string-to-A/B/C/D mapping
+    (Phase 2 work).
+  - The CHESS venv CI setup for the 2 keras-gated
+    tests.
 
-When the `feature/digital-twin` branch lands, the following need
-a post-merge BIBLE update in the same commit:
+### Decisions that emerged from the integration
 
-- **D-3 and D-7:** the "superseded by incoming twin" notes need to
-  be replaced with final-form decisions. The tradeoff tables and
-  rationale can be kept as historical context or condensed; the
-  final decision statement at the top of each needs to reflect the
-  actual final scope.
-- **§5 "The hand-authored knowledge catalogs":** needs to be
-  rewritten to describe the single-Python-module catalog (D-10)
-  instead of the YAML loader. The example YAML shape sketches can
-  be replaced with example Python enum + spec definitions.
-- **§6 "The digital twin":** needs to be rewritten from "twin
-  scope being re-specified" to "twin scope is the 5+ subsystems,
-  13 causes, 9 procedures documented in
-  `mission_ops/twin/procedures.py`."
-- **§7 "Trust and approval":** the 3-tier vs 4-class question
-  needs a final answer. The mapping table I drafted in the plan
-  needs to be replaced with the owner's actual approval vocabulary
-  from the twin spec, mapped to A/B/C/D (or to a different scheme
-  if the owner prefers).
-- **Glossary:** the new channel and subsystem entries need their
-  final definitions (units, nominal ranges, abnormal thresholds)
-  copied in from the twin module.
+Four new decisions were added to §4 as a direct result
+of the integration work:
 
-The merge commit (or its immediate follow-up) must contain a
-BIBLE-only commit that makes the above updates. **No `main`
-commit that contains code from the twin branch is acceptable
-without the corresponding BIBLE updates in the same PR.** This
-is a hard rule, encoded here so future agents don't skip it.
+- **[D-12](#d-12-propose-uses-validation-based-ranking-not-catalog-lookup):** Propose uses
+  validation-based ranking, not catalog lookup. The
+  twin is the ranking function, not a lookup table.
+  This is the biggest architectural surprise of the
+  integration — the pre-merge BIBLE §2 framed Propose
+  as "look up procedure catalog by cause," which was
+  replaced by the actual landing.
+- **[D-13](#d-13-the-twin-runs-in-process-same-python-interpreter-as-live):** The twin runs
+  in-process, same Python interpreter as `live/`.
+  Pre-merge BIBLE §6 framed this as a Phase 2 evolution;
+  it landed in Phase 1 because the lazy-import
+  pattern kept the deployment story simple.
+- **[D-14](#d-14-the-bridge-is-the-only-place-live-imports-from-twin):** The bridge is
+  the only place `live/` imports from `twin/`. Codified
+  from the integration work; previously just a
+  design goal in the pre-merge BIBLE §14.
+- **[D-15](#d-15-terminal-demos-stay-alongside-the-frontend-they-answer-different-questions):**
+  Terminal demos stay alongside the frontend (once
+  it lands); they answer different questions. The
+  pre-merge BIBLE had no frontend; the integration
+  work landed 3 demos that answer the deep-detail
+  questions, and the 3-phase frontend (§3.2) will
+  answer the live-view questions.
 
-### What the merge must NOT do
+### Where to look
 
-- **Do not** change the names or types of the existing public APIs
-  in `live/` or `telemanom/`. The Detect stage contract is locked.
-- **Do not** introduce LLM dependencies. The LLM is a Phase 4
-  narrator; the twin branch is LLM-free.
-- **Do not** introduce OPA, NATS, Redis, or any Phase 2/3
-  infrastructure. The twin is the in-process deterministic
-  simulator; the bus is the in-process `asyncio.Queue`.
-- **Do not** introduce a database. State is in-memory; the only
-  on-disk artifacts are the trained LSTM weights (already in
-  `models/`) and the runbook JSON (Phase 3).
-- **Do not** rewrite the existing `live/` or `telemanom/` code.
-  Add new code under `mission_ops/`; do not touch old code.
-- **Do not** add a CI configuration without an explicit owner
-  request. CI is not in the current scope.
+| What you want | Where |
+|---|---|
+| The 7-stage pipeline contract | §2 |
+| What's runnable today | §3.1 |
+| What's being built next (frontend) | §3.2 |
+| What's deferred (Phase 2/3/4 + polish) | §3.3 |
+| Why Propose uses twin ranking | D-12 |
+| Why twin is in-process | D-13 |
+| Why the bridge is the seam | D-14 |
+| Why demos + frontend | D-15 |
+| The catalog and its invariants | §5 |
+| The twin's actual scope and the two-trajectory Validate | §6 |
+| The 13 causes | §6.2 |
+| The 9 procedures | §6.3 |
+| The cause→procedure map | §6.4 |
+| How Validate works | §6.5 |
+| The repo's actual file layout | §11 |
+| Vendored references and what we don't depend on | §12 |
+| New terms (ValidationResult, Proposal, Trajectory, Bridge, etc.) | §13 |
+
+### What the integration must NOT do (still binding)
+
+The "What the merge must NOT do" list from the pre-merge
+BIBLE §14 is still binding — it describes invariants
+that the integration has not violated, and that future
+work must continue to honor:
+
+- **Do not** change the names or types of the existing
+  public APIs in `live/` or `telemanom/`. The Detect
+  stage contract is locked.
+- **Do not** introduce LLM dependencies. The LLM is a
+  Phase 4 narrator; the twin branch and all subsequent
+  work is LLM-free.
+- **Do not** introduce OPA, NATS, Redis, or any Phase
+  2/3 infrastructure without an explicit Phase 2/3
+  work item. The twin is the in-process deterministic
+  simulator.
+- **Do not** introduce a database. State is in-memory;
+  the only on-disk artifacts are the trained LSTM
+  weights and the runbook JSON (Phase 3).
+- **Do not** rewrite the existing `live/` or
+  `telemanom/` code. Add new code under
+  `digital-twin/`; do not touch old code.
+- **Do not** add a CI configuration without an
+  explicit owner request. CI is not in the current
+  scope.
+- **Do not** add an LLM SDK or narrator protocol
+  without a Phase 4 work item. D-6 is binding.
+
+### The BIBLE update rule (still binding)
+
+**No commit that contains code from the twin branch
+or that changes the architecture is acceptable without
+the corresponding BIBLE update in the same commit.**
+This is a hard rule. The pre-merge BIBLE §14
+established it; the post-merge BIBLE update
+(this rewrite) honors it. Future agents must
+continue to honor it: if you change the
+architecture, update the BIBLE in the same commit.
 
 ---
 
-*Last updated: when the architecture changes. The Bible is the project's
-source of truth. Code may drift; the Bible must not.*
+*Last updated: 2026-09-01 (post-merge BIBLE update). The
+BIBLE is the project's source of truth. Code may
+drift; the BIBLE must not.*
