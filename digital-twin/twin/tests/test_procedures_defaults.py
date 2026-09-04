@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from twin.procedures import (
-    Cause, Procedure, PROCEDURE_REGISTRY, get_candidate_procedures,
+    Cause, Procedure, PROCEDURE_REGISTRY, VALID_MISSION_IMPACTS,
+    VALID_REVERSIBILITY, get_candidate_procedures,
     get_default_params, apply_procedure,
 )
 
@@ -51,3 +52,51 @@ def test_eps_shed_default_params_match_smoke_test():
     we keep them identical so the smoke test is not lying."""
     p = get_default_params(Procedure.EPS_SHED_LOAD)
     assert p == {"load_reduction_a": 1.0, "duration_s": 3600.0}
+
+
+# ----- Catalog-level editorial signals (effort / impact / reversibility) ---
+
+def test_every_procedure_has_effort_score_in_unit_range():
+    """effort_score must be a float in [0.0, 1.0] for every entry.
+    The import-time validation already enforces this; the test
+    guards against a future relaxation."""
+    for proc in Procedure:
+        spec = PROCEDURE_REGISTRY[proc]
+        assert isinstance(spec.effort_score, float)
+        assert 0.0 <= spec.effort_score <= 1.0, (
+            f"{proc.value}: effort_score={spec.effort_score} out of [0,1]"
+        )
+
+
+def test_every_procedure_has_valid_mission_impact():
+    """mission_impact must be one of the allowed values."""
+    for proc in Procedure:
+        spec = PROCEDURE_REGISTRY[proc]
+        assert spec.mission_impact in VALID_MISSION_IMPACTS, (
+            f"{proc.value}: mission_impact={spec.mission_impact!r}"
+        )
+
+
+def test_every_procedure_has_valid_reversibility():
+    """reversibility must be one of the allowed values."""
+    for proc in Procedure:
+        spec = PROCEDURE_REGISTRY[proc]
+        assert spec.reversibility in VALID_REVERSIBILITY, (
+            f"{proc.value}: reversibility={spec.reversibility!r}"
+        )
+
+
+def test_wait_is_lowest_effort_and_most_reversible():
+    """Spot-check the editorial judgments: WAIT is the cheapest and
+    safest procedure in the catalog (no work, no impact, trivial
+    rollback). MODE_CHANGE_TO_SAFE is the most expensive and
+    hardest to reverse."""
+    wait = PROCEDURE_REGISTRY[Procedure.WAIT]
+    assert wait.effort_score == 0.05
+    assert wait.mission_impact == "none"
+    assert wait.reversibility == "trivial"
+
+    mode_change = PROCEDURE_REGISTRY[Procedure.MODE_CHANGE_TO_SAFE]
+    assert mode_change.effort_score == 0.85
+    assert mode_change.mission_impact == "mission-ending"
+    assert mode_change.reversibility == "hard"

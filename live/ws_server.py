@@ -22,9 +22,10 @@ import asyncio
 import json
 import logging
 import os
+import queue
 from collections import deque
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -81,6 +82,13 @@ class AppState:
         # carries twin_verdict when an alert tick matches a known fault.
         self.latest_verdict: Optional[dict] = None
         self.latest_fault_id: Optional[str] = None
+        # Phase 1+ (parallel twin sims): a thread-safe queue of
+        # per-step progress events from the worker threads running
+        # validate_procedure() in parallel. The producer loop drains
+        # this once per tick and attaches the most recent event to
+        # the next tick message as the "sim_progress" field. Bounded
+        # so a runaway sim can't OOM the process.
+        self.sim_progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=2000)
 
     def shutdown(self) -> None:
         self.running = False
@@ -228,12 +236,52 @@ def create_app(model_path: Optional[str] = None) -> FastAPI:
         # the fault's expected behavior, not on the (not-yet-detected)
         # LSTM alerts. The next tick's alerts will then trigger the
         # broadcast of the stashed verdict.
+        #
+        # progress_cb is built fresh per request; it pushes
+        # per-step events from the parallel sim worker threads into
+        # the AppState queue, which the producer loop drains once
+        # per tick and attaches to the next tick message.
+        def _make_progress_cb() -> Callable[[str, int, int, dict], None]:
+            def cb(
+                procedure: str,
+                step: int,
+                total: int,
+                snapshot: dict,
+            ) -> None:
+                msg = {
+                    "procedure": procedure,
+                    "step": step,
+                    "total": total,
+                    "t_s": float(snapshot.get("t_s", 0.0)),
+                    "battery_soc": float(snapshot.get("battery_soc", 0.0)),
+                    "battery_temp_c": float(snapshot.get("battery_temp_c", 0.0)),
+                    "payload_temp_c": float(snapshot.get("payload_temp_c", 0.0)),
+                }
+                try:
+                    state.sim_progress_queue.put_nowait(msg)
+                except queue.Full:
+                    # Drop the oldest event to make room. This is
+                    # defensive — the queue only fills if a sim is
+                    # 10x the normal horizon. The producer loop
+                    # always reads from the queue, so the drop is
+                    # self-healing.
+                    try:
+                        state.sim_progress_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        state.sim_progress_queue.put_nowait(msg)
+                    except queue.Full:
+                        pass
+            return cb
+
         verdict = run_phase1_pipeline(
             fault_type=inject_resp["fault_type"],
             fault_params={},   # bridge handled the params already
             alerts=[],
             channel_hint=channel,
             horizon_s=horizon_s, dt_s=dt_s,
+            progress_cb=_make_progress_cb(),
         )
         if verdict is not None:
             state.latest_verdict = verdict
@@ -276,6 +324,18 @@ def create_app(model_path: Optional[str] = None) -> FastAPI:
         window_arr = np.array(list(state.window), dtype=np.float32)
         pred = _predict_aggregate(window_arr, state.config.n_predictions)
         alerts = state.error_stream.tick(actual=float(tick.value), predicted=pred)
+        # Drain the most recent twin sim progress event (if any).
+        # The producer runs at 5 Hz; the parallel sims may push
+        # dozens of events between ticks. We surface only the
+        # most recent — the frontend uses it to render a single
+        # "this sim is at step N/M" line. If the user wants to
+        # see every event, they shorten dt_s or raise tick_hz.
+        sim_progress: Optional[dict] = None
+        while True:
+            try:
+                sim_progress = state.sim_progress_queue.get_nowait()
+            except queue.Empty:
+                break
         msg = {
             "t": state.error_stream.t,
             "value": float(tick.value),
@@ -284,6 +344,7 @@ def create_app(model_path: Optional[str] = None) -> FastAPI:
             "injected": bool(tick.injected),
             "anomaly": None,
             "twin_verdict": None,
+            "sim_progress": sim_progress,
         }
         if alerts:
             latest = max(alerts, key=lambda a: a.score)

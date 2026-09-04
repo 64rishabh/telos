@@ -17,6 +17,10 @@
 2. [The 7-stage pipeline](#2-the-7-stage-pipeline)
 3. [Current implementation state](#3-current-implementation-state)
 4. [Decisions we took (and the alternatives we rejected)](#4-decisions-we-took-and-the-alternatives-we-rejected)
+   - [D-1 through D-15 (as previously documented)](#d-1-through-d-15-as-previously-documented)
+   - [D-16. Catalog-level editorial fields](#d-16-catalog-level-editorial-fields-effort_score-mission_impact-reversibility)
+   - [D-17. Propose runs top-K simulations in parallel](#d-17-propose-runs-top-k-simulations-in-parallel-and-streams-progress-to-the-frontend)
+   - [D-18. RankedCandidate replaces the candidates_ranked tuple](#d-18-rankedcandidate-replaces-the-candidates_ranked-tuple)
 5. [The hand-authored knowledge catalogs](#5-the-hand-authored-knowledge-catalogs)
 6. [The digital twin](#6-the-digital-twin)
 7. [Trust and approval](#7-trust-and-approval)
@@ -102,9 +106,13 @@ the LLM (when added in Phase 4) is a narrator — never an authority.
                   |
                   v
 3. PROPOSE     digital-twin/twin/propose.py — VALIDATION-BASED
-               RANKING: calls validate_procedure() for every
-               candidate Procedure, ranks by risk_score
-               returns Proposal with the full ranking attached
+               RANKING with catalog-level pre-filter: trims the
+               candidate set to top-K by effort_score /
+               mission_impact / reversibility (D-16), then calls
+               validate_procedure() in parallel in a
+               ThreadPoolExecutor, ranks by risk_score, returns
+               Proposal with the full ranking + per-candidate
+               catalog fields attached (D-17, D-18)
                   |
                   v
 4. VALIDATE    digital-twin/twin/validate.py — projects the twin
@@ -256,69 +264,157 @@ Diagnose itself only sees the symptom window.
 
 **What it does:** given a `Cause` and the current twin state, pick the
 best `Procedure` by twin-validated risk. **Propose does not pick by
-catalog rank or `default_procedure_id`.** It calls
-`validate_procedure()` for *every* candidate procedure returned by
-`get_candidate_procedures(cause)`, ranks them by the
-`risk_score` Validate returns, and picks the lowest.
+catalog rank or `default_procedure_id`.** It runs a two-stage
+selection:
 
-This is the **validation-based ranking** decision (D-12). It is the
-biggest departure from the original "Propose looks up a procedure by
-catalog" framing in earlier BIBLE drafts. The reasoning: the twin is
-the source of truth for "what will happen if I apply procedure X to
-state S." Letting it do the ranking means Propose is honest — it
-picks what the twin says is best, not what the catalog says should be
-best. The cost is the time to validate every candidate (~30-120ms
-for the demo loop's 2-3 candidates, which is invisible to the
-operator).
+1. **Pre-filter** the candidate set returned by
+   `get_candidate_procedures(cause)` to `PROPOSE_TOP_K = 5` using
+   cheap catalog-level signals (`effort_score`, `mission_impact`,
+   `reversibility` — D-16). This is a stable lexicographic sort;
+   no twin simulation runs during pre-filter.
+2. **Validate in parallel** the top-K candidates in a
+   `ThreadPoolExecutor` (one worker per candidate). Each
+   `validate_procedure()` call returns a `risk_score`; Propose
+   sorts the survivors by `risk_score` ascending and picks the
+   lowest.
 
-**Where it lives:** `digital-twin/twin/propose.py` (154 lines).
-Defines the `Proposal` dataclass (`cause`, `cause_score`, `procedure`,
-`procedure_params`, `risk_score`, `validation`, `verdict`,
-`candidates_ranked`) and the `propose(cause, starting_state, ...)`
-function.
+This is the **validation-based ranking** decision (D-12), now with
+the pre-filter and parallel sims that D-12's "Future evolution"
+called for. The reasoning: the twin is the source of truth for
+"what will happen if I apply procedure X to state S." Letting it
+do the ranking means Propose is honest — it picks what the twin
+says is best, not what the catalog says should be best. The
+pre-filter keeps Validate's cost bounded as the catalog grows
+(D-16); the parallel sims keep the wall time bounded as the top-K
+grows (D-17).
+
+**Where it lives:** `digital-twin/twin/propose.py` (now ~290 lines
+after the D-16/D-17/D-18 changes). Defines:
+
+- `PROPOSE_TOP_K: int = 5` — the maximum number of candidates
+  fed to Validate.
+- `_coarse_rank_key(proc) -> tuple` — the lexicographic pre-filter
+  key: `(effort_score, mission_impact_score, reversibility_score)`.
+  Lower is better. Two small dicts map the categorical values to
+  floats (`MISSION_IMPACT_SCORE`, `_REVERSIBILITY_SCORE`).
+- `RankedCandidate` dataclass — one row in
+  `Proposal.candidates_ranked`. Carries `procedure`, `risk_score`,
+  `validation`, and the three catalog-level fields
+  (`effort_score`, `mission_impact`, `reversibility`).
+- `Proposal` dataclass — `cause`, `cause_score`, `procedure`,
+  `procedure_params`, `risk_score`, `validation`, `verdict`,
+  `candidates_ranked: list[RankedCandidate]`.
+- `propose(cause, starting_state, ..., progress_cb=None) ->
+  Proposal` — the main entry point.
 
 **What it consumes:** a `Cause` (from Stage 2), a starting twin
 state (a `dict` matching the `twin.state.make_default_state()` shape),
-and optional `horizon_s` / `dt_s` for the validation horizon
-(defaults: 3600s / 120s = 1 hour at 2-minute steps; the integration
-test uses 14400s / 60s = 4 hours at 1-minute steps).
+optional `horizon_s` / `dt_s` for the validation horizon (defaults:
+3600s / 120s = 1 hour at 2-minute steps; the integration test uses
+14400s / 60s = 4 hours at 1-minute steps), and an optional
+`progress_cb: Callable[[procedure_value, step, total, snapshot],
+None]` that fires from worker threads as each parallel sim
+advances. The bridge/WS server passes the callback in §2 Bridge.
 
-**What it produces:** `Proposal` with the winning procedure, the
-chosen `procedure_params` (read from `PROCEDURE_REGISTRY[procedure].default_params`
-via `get_default_params(procedure)`), and the full ranking for the
-runbook (`candidates_ranked: list[tuple[Procedure, float, ValidationResult]]`).
+**What it produces:** a `Proposal` with:
+
+- the winning `procedure` (lowest `risk_score` from the top-K),
+- the chosen `procedure_params` (read from
+  `PROCEDURE_REGISTRY[procedure].default_params` via
+  `get_default_params(procedure)`),
+- the full top-K ranking in `candidates_ranked: list[RankedCandidate]`,
+  ordered by `risk_score` ascending (so the winner is index 0),
+- the `Verdict` from `to_verdict()` on the winner.
+
 The `to_dict()` method produces a JSON-serializable form for the
-WebSocket broadcast.
+WebSocket broadcast. The `candidates_ranked` entries become
+`{procedure, risk_score, effort_score, mission_impact, reversibility}`
+dicts — the frontend's candidates table consumes these directly
+without re-reading the registry.
 
-**The ranking loop** (`propose.py:125-141`):
+**The selection loop** (`propose.py:propose`):
 
 ```python
-validated = []
-for proc in candidates:
-    params = get_default_params(proc)
-    result = validate_procedure(
-        starting_state, proc, params,
-        horizon_s=horizon_s, dt_s=dt_s,
-    )
-    validated.append((proc, result.risk_score, result))
-validated.sort(key=lambda x: x[1])  # lower risk wins
-best_proc, best_risk, best_validation = validated[0]
-best_verdict = to_verdict(best_validation, best_proc, cause)
+candidates = get_candidate_procedures(cause)
+
+# 1. Pre-filter to top K by catalog-level signals (cheap, no twin).
+scored = [(_coarse_rank_key(p), p) for p in candidates]
+scored.sort(key=lambda x: x[0])
+top_k = [p for _, p in scored[:PROPOSE_TOP_K]]
+
+# 2. Validate all top-K in parallel in a ThreadPoolExecutor.
+#    Each worker calls validate_procedure() and reports per-step
+#    progress via progress_cb.
+workers = min(PROPOSE_TOP_K, len(top_k))
+results: List[RankedCandidate] = []
+with ThreadPoolExecutor(max_workers=workers) as pool:
+    for rc in pool.map(
+        lambda p: _run_one(p, starting_state, horizon_s, dt_s, progress_cb),
+        top_k,
+    ):
+        results.append(rc)
+
+# 3. Sort by risk_score ascending; lowest wins.
+results.sort(key=lambda x: x.risk_score)
+best = results[0]
+best_verdict = to_verdict(best.validation, best.procedure, cause)
 ```
 
-This is *not* parallelized (it's a `for` loop, not a
-`ThreadPoolExecutor` map). The per-procedure validation is ~30-50ms;
-sequential execution of 2-3 candidates is well under the
-operator's patience budget and avoids the locking complexity a
-thread pool would introduce on the shared twin state. If the
-candidate set grows past ~10 procedures (it won't in Phase 1 — the
-largest cause's candidate set is 3), this is the place to add
-parallelism (see D-12's "Future evolution").
+**Why the pre-filter is catalog-level, not twin-level.** The
+pre-filter runs in O(N log N) over `len(candidates)` entries and
+touches only the static `ProcedureSpec` fields. It does not call
+`validate_procedure()`, so it costs effectively nothing (sub-ms
+for the 9-procedure catalog). The runtime `risk_score` from
+Validate is the *final* arbiter — the pre-filter only changes
+*which* candidates reach Validate, not *how* they are ranked once
+there. This is the cheapest place to remove a candidate and the
+safest place to do so: a procedure dropped by the pre-filter
+never had its twin simulation run, so it can never produce a
+lower `risk_score` than a survivor.
+
+**Why parallel sims.** Per-candidate `validate_procedure()` is
+~30-50ms at the default 1h/120s horizon. For 2-3 candidates
+(this is Phase 1's range), sequential is fine. For the future
+catalog (10+ procedures per cause), parallel brings wall time
+back to ~one sim's duration instead of N. The structural test
+`test_propose_runs_candidates_in_parallel` in
+`digital-twin/twin/tests/test_propose.py` asserts the executor
+is created exactly once with the correct `max_workers` count.
+The Python GIL limits the speedup (numpy releases the GIL but
+the per-step bookkeeping in `_run_forward` does not) — observed
+wall time on a 3-candidate run is ~1.5-2x the single-candidate
+time, not 1x. This is acceptable for Phase 1 and will improve
+if the per-step math is moved to a GIL-releasing primitive in
+the future.
+
+**Why `RankedCandidate` is a dataclass, not a tuple.** The
+original 3-tuple `(Procedure, float, ValidationResult)` lost
+information: the catalog-level fields (`effort_score`,
+`mission_impact`, `reversibility`) live in the registry but
+were not propagated to the proposal, so the frontend had to
+re-read the registry to render the candidates table. Promoting
+the rank entry to a `RankedCandidate` dataclass (D-18) carries
+those fields through. The `to_dict()` output is `{procedure,
+risk_score, effort_score, mission_impact, reversibility}` — a
+strict superset of the old `{procedure, risk_score}` shape.
 
 **Edge case:** if a cause has no candidate procedures (defensive
 guard, shouldn't happen for any of the 13 Cause values), Propose
 returns a `WAIT` proposal as the safe default. The pipeline never
-blocks.
+blocks. The `WAIT` candidate's `RankedCandidate` is still
+constructed with the full `RankedCandidate` shape, so the
+frontend's candidates table renders correctly even in this
+fallback path.
+
+**Progress callback contract.** The optional `progress_cb` is
+invoked from worker threads inside `validate_procedure()`. It
+receives `(procedure_value, step, total, snapshot_state)` after
+each sim step, in both the baseline and the predicted run (so the
+total fires per sim is `2 * n_steps`). Consumers MUST be
+thread-safe — the bridge/WS server wraps it in a `queue.Queue`
+on `AppState.sim_progress_queue` and the producer loop drains
+that queue once per tick. The callback may be `None` (legacy
+callers like the offline demos don't pass one).
 
 **LLM involvement:** none. Propose is pure-Python + the twin
 subroutines. The LLM is a Phase 4 future narrator; it does not
@@ -349,7 +445,10 @@ check.
 parameters (the `ProcedureSpec.validate_params(params)` call at the
 top of `validate_procedure` raises `ValueError` on bad params; the
 defaults always validate by construction), and the same
-`starting_state` Stage 3 used.
+`starting_state` Stage 3 used. Also accepts an optional
+`on_step: Callable[[int, int, float, dict], None]` callback that
+fires from the worker thread after each sim step in BOTH the
+baseline and the predicted run.
 
 **What it produces:** `ValidationResult` with both
 `predicted_trajectory` (the procedure applied) and
@@ -373,6 +472,33 @@ for its full duration. The twin's `step_eps`, `step_thermal`, and
 `phase1_demo_deep.py` and `slight_shift_demo.py` show the
 *delta* — the columns are always
 `pred <field>` vs `base <field>`.
+
+**The per-step progress callback** (`on_step`, added in
+D-17). Both `_run_forward` and `validate_procedure` accept an
+optional `on_step: Callable[[int, int, float, dict], None]`
+argument. The callback fires after each physics step in BOTH the
+baseline and the predicted run, with the signature
+`(step_index, total_steps, t_s, current_state)`. The callback
+**does not fire on the final +1 step** (the post-horizon state is
+conceptually outside the sim) — total fires per `validate_procedure`
+call is `2 * n_steps` where `n_steps = horizon_s / dt_s`.
+
+The callback is invoked from whichever thread called
+`validate_procedure()`. When Validate is called from Propose's
+`ThreadPoolExecutor` (D-17), the callback fires from the worker
+thread; consumers MUST be thread-safe. The bridge/WS server wraps
+it in a `queue.Queue` and the producer loop drains that queue
+once per tick (see "Bridge" below and §3.2's
+`sim_progress` field in the WebSocket contract). When Validate is
+called directly (offline demos, the unit tests), the callback
+fires from the caller's thread and no thread-safety wrapping is
+required.
+
+The callback's intended consumer is the WebSocket `sim_progress`
+field (D-17): one event per completed sim step, so the frontend
+can render "this procedure is at step N/M" indicators as the
+parallel sims run. See the Bridge section for the full
+producer/consumer flow.
 
 **Constraint checking** (`validate.py:_check_violations`): six
 fields are checked per timestep:
@@ -421,18 +547,26 @@ Python without the CHESS astropy chain, so the live test suite can
 run in any environment, and so the integration test exercises only
 this module's surface.
 
-**Where it lives:** `live/twin_bridge.py` (348 lines). The bridge
-exposes two public functions and two public tables:
+**Where it lives:** `live/twin_bridge.py` (now ~360 lines after
+D-17). The bridge exposes two public functions and two public
+tables:
 
 - `inject_fault(scheduler, kind, magnitude, channel) -> dict` —
   translates an HTTP injection into a twin `FaultScheduler.inject()`
   call. Returns a JSON-serializable dict with `fault_id`,
   `fault_type`, and the scaled `parameters`.
-- `run_phase1_pipeline(fault_type, fault_params, alerts, channel_hint, ...) -> Optional[dict]`
+- `run_phase1_pipeline(fault_type, fault_params, alerts, channel_hint=None, horizon_s=3600.0, dt_s=120.0, progress_cb=None) -> Optional[dict]`
   — runs Diagnose → Propose → Verdict for the current injection.
   Returns `None` if the twin can't be imported (CHESS venv missing
   on system Python); the live server keeps running, the operator
-  just doesn't see a verdict this tick.
+  just doesn't see a verdict this tick. The optional
+  `progress_cb: Callable[[procedure_value, step, total, snapshot],
+  None]` is forwarded to `propose()` and fires from the worker
+  threads running the parallel twin sims (D-17); the WS server
+  uses it to populate the `sim_progress` field of the WebSocket
+  tick message. The bridge does NOT add thread-safety to the
+  callback — the caller (the WS server) is responsible for
+  forwarding events to the asyncio event loop.
 - `INJECTION_TO_FAULT` — a 13-entry mapping from `(kind, channel)`
   to `(twin fault_type, default params)`. The legacy 3 entries with
   `channel=None` keep backward compat with the original `/inject`
@@ -440,6 +574,25 @@ exposes two public functions and two public tables:
 - `CHANNEL_TO_SUBSYSTEM` — the 8-channel → 4-subsystem map
   (`P-1`/`P-2` → `eps`, `B-1`/`T-1`/`T-2` → `thermal`, `A-1`/`G-1`
   → `adcs`, `D-1` → `comms`).
+
+**`progress_cb` contract** (D-17). The callback's signature is
+`(procedure_value: str, step: int, total: int, snapshot: dict)`.
+- `procedure_value` is the `Procedure.value` string (e.g.,
+  `"eps_shed_non_essential_load"`), so consumers can attribute
+  the event to one of the parallel sims without bookkeeping.
+- `step` is the 0-indexed step in the current sim run;
+  `total` is the total step count for that run
+  (`horizon_s / dt_s`).
+- `snapshot` is the post-step twin state dict; the WS server
+  reads `t_s`, `battery_soc`, `battery_temp_c`, and
+  `payload_temp_c` from it to populate the broadcast event.
+
+The callback fires from worker threads. It may be called
+`2 * (horizon_s / dt_s) * len(top_k_candidates)` times per
+pipeline run (twice per sim step, once for the baseline run and
+once for the predicted run, for each top-K candidate). For the
+default 1h/120s horizon with 3 candidates, that's 60 fires per
+pipeline run — well within a `queue.Queue(maxsize=2000)` budget.
 
 **Lazy-import pattern** (`twin_bridge.py:_ensure_twin_on_path`):
 the `_ensure_twin_on_path()` call lives at the top of every
@@ -625,11 +778,19 @@ and the Phase 3 runbook. The `to_dict()` method produces the
 JSON-serializable form the WebSocket broadcast carries.
 
 **Test surface:** `digital-twin/twin/tests/test_propose.py`
-(covering the ranking math, the default-params fall-back, the
-empty-candidate edge case) and
-`test_procedures_defaults.py` (covering the
-`PROCEDURE_REGISTRY.default_params` and the
-`get_default_params(procedure)` accessor).
+(15 tests; covering the ranking math, the top-K pre-filter,
+the `RankedCandidate` shape, the default-params fall-back,
+the empty-candidate edge case, the `progress_cb` callback
+contract, and the structural executor test that asserts the
+top-K candidates run in a `ThreadPoolExecutor` with the
+correct `max_workers`) and
+`test_procedures_defaults.py` (12 tests; covering the
+`PROCEDURE_REGISTRY.default_params`, the
+`get_default_params(procedure)` accessor, and the
+import-time validation of the D-16 catalog-level editorial
+fields — `effort_score` in `[0.0, 1.0]`, `mission_impact`
+in the allowed set, `reversibility` in the allowed set, plus
+a spot-check of the `WAIT` / `MODE_CHANGE_TO_SAFE` extremes).
 
 #### Stage 4 — Validate (`digital-twin/twin/validate.py` + `verdict.py`)
 
@@ -658,7 +819,9 @@ predictions are within tolerance.
 
 The digital twin is a lumped, deterministic state machine that
 implements the 5 subsystems (EPS, Battery, Thermal, ADCS, Comms)
-across 8 channels. **2,791 lines total**, organized as:
+across 8 channels. **~3,012 lines total** (was 2,791 before the
+D-16/D-17/D-18 additions; the new fields, the parallel sims, and
+the `RankedCandidate` shape added ~220 lines), organized as:
 
 | File | Lines | Role |
 |---|---|---|
@@ -668,9 +831,9 @@ across 8 channels. **2,791 lines total**, organized as:
 | `adcs.py` | 134 | `step_adcs(state, dt_s, ...)` — 2nd-order damped pointing + reaction wheel dynamics with saturation |
 | `fault_injection.py` | 265 | `FaultScheduler` — the 9 fault types and the per-step `apply()` callback |
 | `channel_shaper.py` | 102 | Telemanom-shaped `.npy` per channel (scaled to (-1, 1) per column) |
-| `procedures.py` | 712 | **The single source of truth** for `Cause`, `Procedure`, `ProcedureSpec`, `PROCEDURE_REGISTRY`, `apply_procedure()`, `get_candidate_procedures()` (D-10) |
-| `validate.py` | 306 | `validate_procedure()` + `ValidationResult` + the two-trajectory forward loop |
-| `propose.py` | 154 | `propose()` + `Proposal` + the validation-based ranking loop |
+| `procedures.py` | 785 | **The single source of truth** for `Cause`, `Procedure`, `ProcedureSpec`, `PROCEDURE_REGISTRY`, `apply_procedure()`, `get_candidate_procedures()` (D-10). +73 lines for the D-16 catalog-level editorial fields and their import-time validation |
+| `validate.py` | 326 | `validate_procedure()` + `ValidationResult` + the two-trajectory forward loop. +20 lines for the `on_step` callback parameter (D-17) |
+| `propose.py` | 282 | `propose()` + `Proposal` + `RankedCandidate` + the top-K pre-filter + parallel sims (D-16/D-17/D-18). +128 lines |
 | `diagnose.py` | 152 | `diagnose()` + `SymptomEvent` + `CandidateCause` |
 | `verdict.py` | 136 | `to_verdict()` + `Verdict` + `VerdictStatus` + the `0.3` threshold |
 | `run_sim.py` | 231 | The CLI entry point: `python -m twin.run_sim` runs the full 4-hour twin sim offline |
@@ -709,12 +872,25 @@ the full surface.
 
 #### Test gate
 
-**49/51 tests pass on system Python; 51/51 with the CHESS venv
-active.** The inventory:
+**49 tests pass on system Python in the relevant scope (twin
++ bridge + legacy propose); the 2 keras-gated live tests
+fail pre-existingly without the CHESS venv and pass when
+the venv is active.** The inventory:
 
-- **Twin tests:** 32 in `digital-twin/twin/tests/` (test_diagnose,
-  test_propose, test_verdict, test_procedures_defaults) — all
-  green.
+- **Twin tests:** 42 in `digital-twin/twin/tests/`
+  (test_diagnose, test_propose, test_verdict,
+  test_procedures_defaults) — all green. The 6 new
+  test_propose.py tests (test_propose_filters_to_top_k,
+  test_propose_catalog_fields_in_to_dict,
+  test_propose_progress_callback_fires,
+  test_propose_progress_callback_distinguishes_procedures,
+  test_propose_no_progress_callback_works,
+  test_propose_runs_candidates_in_parallel) cover
+  D-16/D-17/D-18. The 4 new test_procedures_defaults.py
+  tests (effort_score in unit range, valid
+  mission_impact, valid reversibility, wait-is-lowest /
+  mode_change_to_safe-is-highest spot checks) cover
+  D-16.
 - **Live tests, pre-existing:** 13 in `live/tests/`
   (test_error_stream, test_generator, test_model_runner,
   test_integration). 11 pass; 2 fail (`test_load_predict`,
@@ -732,7 +908,17 @@ active.** The inventory:
 The 2 keras-gated failures are not regressions from the digital-
 twin work; they're the test suite's way of saying "the real LSTM
 model isn't loaded." The fix is to set up the CHESS venv in CI
-(not in scope for Phase 1).
+(not in scope for Phase 1). The new tests for the
+D-16/D-17/D-18 changes (catalog fields, parallel sims, progress
+callbacks, RankedCandidate shape) are in `twin/tests/test_propose.py`
+and `twin/tests/test_procedures_defaults.py`; all pass on
+system Python.
+
+**Legacy tests:** 3 in `test/test_30_propose.py` (T13, T14, T15)
+also pass. The T14 test was extended in the same commit to
+assert the new `effort_score` / `mission_impact` / `reversibility`
+keys appear in every `candidates_ranked` entry, guarding the
+WS contract change for any consumer of the broadcast.
 
 #### Demo surface
 
@@ -914,12 +1100,44 @@ type TickMessage = {
     channel: ChannelId;       // the channel the operator injected on
   };
   twin_verdict: null | Proposal;  // null on most ticks; populated on the next tick after an inject that triggered a verdict
+  sim_progress: null | SimProgressEvent;  // null on most ticks; populated while parallel twin sims are running (D-17)
 };
 ```
 
 The `kind` field (operator's injection kind) is **NEVER**
 included in the WebSocket message in Phase 1 — see "The
 `kind` rule" below.
+
+**The `sim_progress` field** (D-17). While the Propose stage is
+running the top-K candidates through the digital twin in parallel,
+each completed sim step in each parallel sim produces a
+`SimProgressEvent` that is pushed to `AppState.sim_progress_queue`
+on the WS server. The producer loop drains the queue once per
+tick and attaches the **most recent** event to the next tick
+message (so a 5 Hz broadcast rate doesn't drown in 60+ events
+from one injection). When the producer loop runs faster than
+the sims, only the last event is visible; when the sims run
+faster than the producer, intermediate events are dropped. The
+field is `null` on ticks that don't have a pending sim event.
+
+```ts
+type SimProgressEvent = {
+  procedure: string;          // e.g. "eps_shed_non_essential_load"
+  step: number;               // 0-indexed step in the current sim run
+  total: number;              // total step count for the run (horizon_s / dt_s)
+  t_s: number;                // sim time at this step, in seconds
+  battery_soc: number;        // state snapshot
+  battery_temp_c: number;
+  payload_temp_c: number;
+};
+```
+
+The frontend's parallel-sims panel renders one line per
+distinct `procedure` it has seen in the most recent N progress
+events, with a step progress bar (e.g., "eps_shed_load: 12/30
+[███████───]"). When the corresponding tick carries a
+`twin_verdict` (the pipeline finished), the panel collapses to
+the candidates table.
 
 #### `Proposal` shape (full payload, exactly what the runbook renders)
 
@@ -930,51 +1148,45 @@ TypeScript `Proposal` type matches this shape 1:1:
 type Proposal = {
   cause: Cause;                                 // enum from digital-twin/twin/procedures.py
   cause_score: number;                          // 0..5, threshold 0.5
-  procedure: Procedure;                         // enum
+  procedure: Procedure;                         // enum (the winner = lowest risk_score)
   procedure_params: Record<string, any>;        // the chosen procedure's params
-  risk_score: number;                           // 0..1
-  validation: ValidationResult;                 // see below
+  risk_score: number;                           // 0..1, runtime risk from twin simulation
   verdict: Verdict;                             // OK | REJECT | INCONCLUSIVE
-  candidates_ranked: Array<{                    // validation-based ranking (D-12)
-    procedure: Procedure;
-    risk_score: number;
-  }>;
-  // -- runbook enrichment (added in Milestone 1 backend commit) --
-  affected_subsystems: SubsystemId[];           // from Cause.affected_subsystems()
-  expected_channels: ChannelId[];               // from Cause.expected_channels()
-  risk_class: "low" | "medium" | "high" | "critical";
-  approval_required: "auto" | "operator" | "director";
-  procedure_description: string;                // human-readable
-  symptom_window: Array<{                       // the SymptomEvents the bridge seeded
-    t: number;
-    channel: ChannelId;
-    subsystem: SubsystemId;
-    kind: "spike" | "shift" | "dropout" | "anomaly";
-    score: number;
-    seq: [number, number];
-  }>;
-  twin_state_endpoints: {                       // last value of each field in predicted_trajectory
-    battery_soc: number;
-    battery_voltage_v: number;
-    battery_temp_c: number;
-    payload_temp_c: number;
-    electronics_temp_c: number;
-    pointing_error_deg: number;
-    link_margin_db: number;
-  };
-  // -- trajectory (3 fields for the runbook canvas) --
-  trajectory: {
-    battery_soc: Array<[number, number]>;       // 31 points, [[t0,v0], ..., [t60,v60]]
-    battery_temp_c: Array<[number, number]>;
-    payload_temp_c: Array<[number, number]>;
-    baseline: {                                 // same shape, no-procedure baseline
-      battery_soc: Array<[number, number]>;
-      battery_temp_c: Array<[number, number]>;
-      payload_temp_c: Array<[number, number]>;
-    };
-  };
+  candidates_ranked: Array<RankedCandidate>;     // top-K, ordered by risk_score asc (D-16/D-18)
+};
+
+type RankedCandidate = {
+  procedure: Procedure;                         // enum
+  risk_score: number;                           // 0..1, runtime
+  effort_score: number;                         // 0..1, catalog-level editorial (D-16)
+  mission_impact: "none" | "minor" | "major" | "mission-ending";  // catalog-level (D-16)
+  reversibility: "trivial" | "easy" | "hard";   // catalog-level (D-16)
 };
 ```
+
+**The frontend's candidates table** (runbook section 6, "Why
+this procedure") renders one row per entry in
+`candidates_ranked`, sortable by `risk_score` (ascending — winner
+is on top) or by `effort_score` (cheap procedures bubble up).
+The winning row is highlighted; non-winning rows show their
+catalog fields so the operator can see "yes, mode_change_to_safe
+would have a lower risk_score, but its mission_impact is
+`mission-ending` and effort_score is 0.85 — that's why we picked
+the other one." This is the demo surface the catalog-level
+editorial fields (D-16) are designed to support.
+
+**Note on the shape delta from earlier BIBLE drafts.** The
+`Proposal` shape shown here is the *current* landed contract
+(D-16, D-17, D-18). Earlier BIBLE drafts included extra
+runbook-enrichment fields at the top level —
+`affected_subsystems`, `expected_channels`, `risk_class`,
+`approval_required`, `procedure_description`, `symptom_window`,
+`twin_state_endpoints`, and a `trajectory` block with the 3-field
+canvas data. None of those have landed in code yet. They are
+expected to land in a follow-up frontend-milestone commit that
+extends `Proposal.to_dict()` to include them. When that commit
+lands, the BIBLE §3.2 TypeScript type above is updated in the
+same commit.
 
 `Verdict`:
 
@@ -1916,29 +2128,47 @@ matters, not the file count.
 **Decision:** Propose does **not** pick a procedure by
 `default_procedure_id`, by catalog rank, or by any
 `risk_class`-based heuristic. It calls `validate_procedure()`
-for *every* candidate procedure returned by
-`get_candidate_procedures(cause)`, ranks them by the `risk_score`
-that Validate returns, and picks the lowest-risk candidate that
-is still `feasible=True`. Ties are broken by stable sort
-(catalog order from `get_candidate_procedures`).
+for every candidate procedure that survives the
+[pre-filter](#d-16-catalog-level-editorial-fields-effort-score-mission_impact-reversibility)
+(see [D-16](#d-16-catalog-level-editorial-fields-effort-score-mission_impact-reversibility)),
+ranks them by the `risk_score` Validate returns, and picks
+the lowest. Ties are broken by stable sort (catalog order from
+`get_candidate_procedures`).
 
-The ranking loop is in `digital-twin/twin/propose.py:125-141`:
+The selection loop is in `digital-twin/twin/propose.py:propose()`:
 
 ```python
-validated = []
-for proc in candidates:
-    params = get_default_params(proc)
-    result = validate_procedure(
-        starting_state, proc, params,
-        horizon_s=horizon_s, dt_s=dt_s,
-    )
-    validated.append((proc, result.risk_score, result))
-validated.sort(key=lambda x: x[1])  # lower risk wins
-best_proc, best_risk, best_validation = validated[0]
+candidates = get_candidate_procedures(cause)
+
+# 1. Pre-filter to top K by catalog-level signals (cheap, no twin).
+scored = [(_coarse_rank_key(p), p) for p in candidates]
+scored.sort(key=lambda x: x[0])
+top_k = [p for _, p in scored[:PROPOSE_TOP_K]]
+
+# 2. Validate all top-K in parallel in a ThreadPoolExecutor.
+results: List[RankedCandidate] = []
+with ThreadPoolExecutor(max_workers=min(PROPOSE_TOP_K, len(top_k))) as pool:
+    for rc in pool.map(
+        lambda p: _run_one(p, starting_state, horizon_s, dt_s, progress_cb),
+        top_k,
+    ):
+        results.append(rc)
+
+# 3. Sort by risk_score ascending; lowest wins.
+results.sort(key=lambda x: x.risk_score)
+best = results[0]
 ```
 
+The pre-filter and the parallel sims are the new pieces;
+see [D-16](#d-16-catalog-level-editorial-fields-effort-score-mission_impact-reversibility)
+and [D-17](#d-17-propose-runs-top-k-simulations-in-parallel-and-streams-progress-to-the-frontend)
+for the rationale. The original sequential `for` loop is
+preserved in this BIBLE entry for historical context only.
+
 Measured wall time: 30-120ms for the demo's 2-3 candidates at
-the default 1h/120s horizon. This is well under the operator's
+the default 1h/120s horizon. With the parallel sims (D-17),
+this is now ~1.5-2x the single-candidate time (GIL-limited)
+instead of 3x. Either way, this is well under the operator's
 patience budget and invisible to the live broadcast rate.
 
 **Alternatives considered:**
@@ -1982,28 +2212,35 @@ to either seed the state with the same defaults
 ranking rather than the specific winner. The current
 `test_propose.py` does the former.
 
-**The ranking is sequential, not parallel.** The
-`for proc in candidates` loop runs each `validate_procedure`
-sequentially in the calling thread. A `ThreadPoolExecutor`
-map was considered; rejected because (i) the per-procedure
-validation is ~30-50ms and the sequential 2-3 candidates are
-well under the latency budget, (ii) parallel validation
-would require locking on the shared `starting_state` (Validate
-deep-copies internally, but the FaultScheduler state in the
-shared `twin.fault_injection` module would need a lock), (iii)
-the code is simpler to read sequentially. If the candidate
-set grows past ~10 procedures (it won't in Phase 1 — the
-largest cause has 3 candidates), this is the place to add
-parallelism (see "Future evolution").
+**The ranking is now parallel (updated 2026-09-04).** The
+sequential `for proc in candidates` loop was replaced by a
+`ThreadPoolExecutor` parallelization in the 2026-09-04 commit
+(see [D-17](#d-17-propose-runs-top-k-simulations-in-parallel-and-streams-progress-to-the-frontend)).
+The original rationale for sequential execution — that
+parallelism would require locking on shared twin state and
+the latency budget was already met — is now superseded: the
+parallel runbook emits per-step progress events to the
+WebSocket so the frontend can render the parallel sims
+visually (a key demo surface for the 3-phase frontend build
+in §3.2). Measured wall time on a 3-candidate run at the
+default 1h/120s horizon is ~1.5-2x the single-candidate
+time (not the theoretical 1x, because the Python GIL
+limits the per-step bookkeeping in `_run_forward` even
+though numpy releases the GIL for the math). This is
+acceptable for Phase 1 and improves if the per-step math is
+moved to a GIL-releasing primitive in the future.
 
 **Future evolution:** if the candidate set grows past ~10
 procedures, the per-candidate validation cost will dominate
-the Propose stage latency. The fix is to add a coarse
-pre-filter using the procedure's `risk_class` (skip
-`critical` procedures unless all `low/medium/high`
-candidates fail) — still using Validate as the final
-arbiter, just with a catalog-driven warm-up. Out of scope
-for Phase 1.
+the Propose stage latency even with parallelism. The fix
+landed in 2026-09-04 as a coarse pre-filter using the
+procedure's catalog-level editorial fields
+(`effort_score`, `mission_impact`, `reversibility` — see
+[D-16](#d-16-catalog-level-editorial-fields-effort-score-mission_impact-reversibility))
+— still using Validate as the final arbiter, just with a
+catalog-driven warm-up that keeps the top-K bounded.
+Future growth past the current `PROPOSE_TOP_K = 5` is
+addressed by raising the constant, not by code change.
 
 ---
 
@@ -2239,6 +2476,330 @@ stay as the audit trail.
 
 ---
 
+### D-16. Catalog-level editorial fields: effort_score, mission_impact, reversibility
+
+> **Status (added 2026-09-04):** this decision is **new**, driven
+> by the 3-phase frontend build's need to render a sortable
+> candidates table (and the parallel-sims panel) without
+> re-reading the registry. The pre-2026-09-04 `Proposal` shape
+> only carried the runtime `risk_score` per candidate; the new
+> fields are the catalog-level editorial signal that lets the
+> frontend answer "why this procedure, not that one" when the
+> runtime `risk_score` alone doesn't disambiguate.
+
+**Decision:** every `ProcedureSpec` carries three new
+hand-authored, PR-reviewed fields in addition to the existing
+`risk_class` and `approval_required`:
+
+- **`effort_score: float`** in `[0.0, 1.0]`. Lower is less
+  operator/spacecraft work. Drives the Propose pre-filter
+  (lexicographic first key) and the frontend's candidates
+  table sort.
+- **`mission_impact: str`** — one of `"none"`, `"minor"`,
+  `"major"`, `"mission-ending"`. How much mission capability is
+  lost while the procedure is in effect. Distinct from
+  `risk_class` ("how bad if it fails"): a `critical` procedure
+  can be `none` (e.g., `mode_change_to_safe` is `mission-ending`
+  for impact but `critical` for risk) and a `low`-risk
+  procedure can be `major` (e.g., `thermal_throttle_payload`).
+- **`reversibility: str`** — one of `"trivial"`, `"easy"`,
+  `"hard"`. How easy it is to undo the procedure's effect once
+  started. `"trivial"` = instant rollback, `"easy"` = stop the
+  procedure and the spacecraft returns to nominal within a
+  step or two, `"hard"` = the procedure's effect persists and
+  recovery requires another procedure.
+
+The import-time validation in `procedures.py` rejects any
+registry entry with a `mission_impact` or `reversibility`
+value not in the allowed set, or an `effort_score` outside
+`[0.0, 1.0]`. The constant `VALID_MISSION_IMPACTS` and
+`VALID_REVERSIBILITY` are exported so the test suite can
+import the allowed sets without re-declaring them. The
+default values for these fields on a bare `ProcedureSpec()`
+are `effort_score=0.5`, `mission_impact="minor"`,
+`reversibility="easy"` — conservative middle-of-the-road
+defaults that surface in the test suite if a future procedure
+is added without explicitly populating them.
+
+**Alternatives considered:**
+
+- **(a) Reuse `risk_class` for the pre-filter.** Rejected
+  because `risk_class` and `effort_score` are correlated but
+  not the same: `mode_change_to_safe` is `critical` for
+  `risk_class` (the mission may not recover) but `0.85` for
+  `effort_score` (one command, instant). Using `risk_class`
+  for the pre-filter would skip `mode_change_to_safe` in
+  cases where it was actually the right call; using
+  `effort_score` lets the catalog express both axes.
+- **(b) Reuse `approval_required` ("auto" < "operator" <
+  "director") as the friction signal.** Rejected because
+  `approval_required` is org-policy routing that drifts over
+  time as policies change. The catalog-level editorial fields
+  are *expected behavior*, not *org policy*; a procedure's
+  `effort_score` should be stable across policy revisions.
+- **(c) Add the three new fields as chosen.** They are
+  orthogonal to the existing `risk_class` and
+  `approval_required`, hand-authored in the same PR as the
+  procedure's `apply_fn`, and reviewed by the same people who
+  review the catalog. The cost is a small per-procedure
+  editorial burden; the benefit is that the demo can answer
+  "why this procedure" with structured data.
+
+**Why we chose what we chose:** the three new fields are the
+minimum editorial signal needed to render the candidates
+table. With them, the runbook's "Why this procedure" section
+(D-18) can show the operator: "we picked `eps_shed_load` over
+`mode_change_to_safe` because even though `mode_change_to_safe`
+has a lower `risk_score` (0.05 vs 0.18), its `effort_score` is
+0.85 (vs 0.30) and its `mission_impact` is `mission-ending`
+(vs `minor`). The system did the right thing; the table
+explains why." Without the new fields, the same explanation
+would require the operator to read the `apply_fn` body of
+both procedures and reason about cross-subsystem coupling —
+which is exactly the work the system is supposed to be doing.
+
+**Tradeoff:** the three new fields are static catalog values,
+not measured outcomes. The runtime `risk_score` from Validate
+can disagree with the editorial signal — a procedure that the
+catalog says is "easy" can turn out to have a high runtime
+`risk_score` when applied to a degraded state. This is a
+feature, not a bug: the disagreement is the system's signal
+that the catalog is stale, and it surfaces in the runbook.
+The alternative — making the catalog fields a function of
+runtime state — would re-introduce the catalog-vs-twin drift
+that D-10 was designed to prevent.
+
+**Future evolution:** the allowed sets for `mission_impact`
+and `reversibility` are deliberately small (4 and 3 values
+respectively) to keep the editorial burden low. As the
+catalog grows past ~50 procedures, two extensions become
+worth considering: (a) splitting `mission_impact` into
+`mission_impact_electrical`, `mission_impact_thermal`, etc.
+when cross-subsystem procedures make a single
+`mission_impact` value ambiguous; (b) adding a fourth
+reversibility value `"irreversible"` for procedures that
+require manual recovery outside the catalog. Neither is
+needed for the current 9 procedures.
+
+---
+
+### D-17. Propose runs top-K simulations in parallel and streams progress to the frontend
+
+> **Status (added 2026-09-04):** this decision is **new**, driven
+> by the 3-phase frontend build (§3.2) which needs a live view
+> of the parallel twin sims as they run. The pre-2026-09-04
+> Propose was a sequential `for` loop that called
+> `validate_procedure()` once per candidate; the new Propose
+> runs the top-K (D-16) candidates in parallel in a
+> `ThreadPoolExecutor` and emits per-step progress events that
+> the bridge forwards to the WebSocket.
+
+**Decision:** `twin.propose.propose()` runs the
+pre-filtered top-K candidates in parallel using
+`concurrent.futures.ThreadPoolExecutor(max_workers=min(PROPOSE_TOP_K,
+len(top_k)))`. Each worker calls
+`validate_procedure(starting_state, proc, params, ...,
+on_step=on_step)` and the `on_step` callback forwards a
+`(procedure_value, step, total, snapshot)` event to the
+caller's `progress_cb`. The `live/twin_bridge.py` function
+`run_phase1_pipeline` accepts the `progress_cb` as an
+optional parameter and forwards it to `propose()`. The
+`live/ws_server.py` inject handler builds a progress
+callback that pushes each event into an
+`AppState.sim_progress_queue` (`queue.Queue`, maxsize=2000);
+the producer loop drains the queue once per tick and
+attaches the most recent event to the next WebSocket
+broadcast as the `sim_progress` field (D-17 contract, §3.2).
+
+**Alternatives considered:**
+
+- **(a) asyncio.gather with run_in_executor.** Rejected
+  because the `propose()` function is currently sync
+  (called from the sync `inject_twin_fault` FastAPI
+  handler). Switching to `asyncio` would force the handler
+  to be async, and the CPU-bound twin sims would still
+  release the GIL via the executor — no net win.
+- **(b) Sequential `for` loop, no per-step progress
+  events.** This is the pre-2026-09-04 state. Rejected
+  because the frontend demo surface is "watch 5 sims run
+  in parallel"; without per-step events the frontend has
+  no way to render that surface (it would only see the
+  final verdict). The wall-time cost of sequential is
+  acceptable for 2-3 candidates but not for the
+  future-catalog 10+ candidates.
+- **(c) ThreadPoolExecutor with per-step progress events
+  (chosen).** Matches the 3-phase frontend milestone
+  requirements (§3.2) and bounds the wall time as the
+  catalog grows. The Python GIL limits the actual
+  speedup (numpy releases the GIL for math but the
+  per-step bookkeeping in `_run_forward` does not) — see
+  "Measured wall time" in D-12.
+
+**Why we chose what we chose:** the `sim_progress` event
+stream is the demo surface for the parallel-sims panel in
+the frontend. Without it, the only "evidence of parallelism"
+the operator sees is the final verdict — which looks
+identical to the pre-2026-09-04 sequential verdict. The
+event stream is what makes the parallelism visible. The
+bridge's choice to *not* wrap the callback in thread-safety
+primitives (and to delegate that to the WS server) keeps
+the bridge's surface area small and aligns with D-14 (the
+bridge is the seam, not a thread-safety policy).
+
+**`on_step` callback contract.** The callback signature
+is `(step_index, total_steps, t_s, current_state)`. It
+fires from whichever thread called `validate_procedure()` —
+i.e., the worker thread inside Propose's executor, not the
+caller's thread. When Validate is called directly (offline
+demos, unit tests), the callback fires from the caller's
+thread and no thread-safety wrapping is required. The
+callback does NOT fire on the final `+1` step (the
+post-horizon state is conceptually outside the sim); total
+fires per `validate_procedure` call is
+`2 * n_steps` (once per sim step in the baseline run, once
+per sim step in the predicted run).
+
+**Queue overflow protection.** `AppState.sim_progress_queue`
+is a `queue.Queue(maxsize=2000)`. When the queue is full,
+the producer callback drops the oldest event and inserts
+the new one. This is defensive — the queue only fills if
+the sim runs at sub-second `dt_s` with 5+ parallel sims,
+which is well outside the current demo's parameters. The
+drain loop in `_step_once()` always reads the queue to
+completion, so a transient overflow self-heals on the next
+tick.
+
+**At most one `sim_progress` event per tick.** The
+producer loop drains the queue in a `while True` loop
+(keeping the most recent event) and attaches only that one
+to the tick message. The 5 Hz broadcast rate and the
+sub-second sim rate mean 30+ events can pile up between
+ticks; we take the most recent. If the user wants to see
+every event, they raise the producer tick rate (or shorten
+`dt_s`); the server doesn't enforce per-event delivery.
+
+**Tradeoff:** the WS message size grows by ~200 bytes per
+`sim_progress` event. With 5 sims × 30 steps = 150 events
+between ticks, the queue can hold ~30KB; the broadcast
+overhead is one event per tick. Acceptable. If the
+catalog grows past 10 procedures or `dt_s` drops below 1
+second, the queue bounds and the at-most-one-per-tick
+drain both protect the broadcast from overwhelming the
+WS clients.
+
+**Future evolution:** the at-most-one-per-tick drain
+deliberately drops intermediate events. A finer throttle
+("send every Nth step" or "send at most K events per
+sim per tick") would let the frontend render smoother
+animations of long sims. Out of scope for Phase 1. A
+second future extension is per-sim progress ack: the
+frontend could acknowledge receipt of progress events so
+the WS server can garbage-collect the in-flight sims
+early if the client disconnects. Out of scope for Phase
+1; the current behavior is "fire and forget."
+
+---
+
+### D-18. RankedCandidate replaces the candidates_ranked tuple
+
+> **Status (added 2026-09-04):** this decision is **new**, driven
+> by the same frontend-candidates-table requirement as D-16
+> and D-17. The pre-2026-09-04 `Proposal.candidates_ranked`
+> was a `list[tuple[Procedure, float, ValidationResult]]` —
+> a 3-tuple that lost the catalog-level editorial signal
+> (D-16). The new `RankedCandidate` dataclass carries the
+> signal through.
+
+**Decision:** `Proposal.candidates_ranked: list[RankedCandidate]`
+where `RankedCandidate` is a frozen-shaped dataclass with
+six fields:
+
+```python
+@dataclass
+class RankedCandidate:
+    procedure: Procedure
+    risk_score: float           # runtime, from validate_procedure
+    validation: ValidationResult
+    effort_score: float         # catalog-level (D-16)
+    mission_impact: str         # catalog-level (D-16)
+    reversibility: str          # catalog-level (D-16)
+```
+
+`Proposal.to_dict()` serializes each `RankedCandidate` to
+`{procedure, risk_score, effort_score, mission_impact,
+reversibility}` — a strict superset of the old
+`{procedure, risk_score}` shape. The `validation` field
+stays on the winning candidate's `Proposal.validation` and
+is NOT included in every `candidates_ranked` entry (it's
+hundreds of arrays; the runbook only needs the winner's
+trajectory for the canvas plot). If the frontend ever
+needs to plot every candidate's trajectory, the
+`RankedCandidate.validation` field is the place to put it.
+
+**Alternatives considered:**
+
+- **(a) Keep the 3-tuple and add a sidecar
+  `List[Dict[str, Any]]` for catalog metadata.** Hacky —
+  two parallel lists that have to stay in sync. The
+  pre-2026-09-04 codebase had this implicit dualism
+  (the 3-tuple and the registry lookup the bridge did
+  to enrich the WS payload) and it produced the
+  `alerts_to_symptom_events` legacy hardcode that
+  §3.3 defers.
+- **(b) Promote to a dict instead of a dataclass.** A
+  dict would work but loses the type hints and the
+  `ranked.procedure` ergonomics. The dataclass is a
+  dict-with-types; no real downside.
+- **(c) Dataclass with all six fields (chosen).** Type-safe,
+  ergonomic (`rc.procedure` not `rc["procedure"]`), carries
+  enough metadata for the frontend to render the candidates
+  table without re-reading the registry, and small enough
+  (~6 fields, all primitives) that the WS payload doesn't
+  bloat.
+
+**Why we chose what we chose:** the tuple was a leaky
+abstraction. Every consumer that needed catalog metadata
+(the bridge when serializing to WS, the demo when printing
+the candidates table, the test suite when asserting
+catalog fields) had to re-look-up the procedure in the
+registry. That re-lookup is what made D-16 impossible to
+implement without a shape change — the candidates table
+needed the catalog fields on every row, and the tuple
+didn't have them. The dataclass is the smallest shape
+change that supports D-16 and the frontend.
+
+**Tradeoff:** `RankedCandidate` is a public dataclass
+exported from `twin.propose`. Any future change to its
+fields is a BIBLE-significant contract change. The
+`validation` field in particular is the heaviest field
+by far (hundreds of arrays per entry); the to_dict()
+output deliberately drops it from the broadcast. If a
+future Phase needs to broadcast every candidate's
+trajectory, the `validation` field is the carrier and
+the WS payload size will grow accordingly.
+
+**Migration path for any external consumer.** The
+pre-2026-09-04 `candidates_ranked` was a list of 3-tuples;
+the new shape is a list of dataclasses. The change is
+*not* API-compatible at the Python level. The integration
+test (`live/tests/test_injection_bridge.py`) and the
+demo scripts were updated in the same commit. The WS
+contract change is *additive* at the JSON level (new
+keys per entry) so any WS consumer that ignores unknown
+keys keeps working; consumers that destructure the entry
+need to update.
+
+**Future evolution:** if the runbook needs every
+candidate's full trajectory (Phase 3?), the
+`RankedCandidate.validation` field is the carrier and
+the WS payload size budget becomes the constraint.
+Likely resolution: add a `RankedCandidate.summary` field
+with a coarse one-line outcome (e.g., "SoC ends at 0.42,
+no violations") and have the WS broadcast that instead
+of the full `validation` block.
+
+---
+
 ---
 
 ## 5. The hand-authored knowledge catalogs
@@ -2366,6 +2927,10 @@ class ProcedureSpec:
     risk_class: str = "low"               # "low" | "medium" | "high" | "critical"
     approval_required: str = "operator"   # "auto" | "operator" | "director"
     default_params: Optional[Dict[str, Any]] = None
+    # -- D-16 catalog-level editorial fields (hand-authored, PR-reviewed) --
+    effort_score: float = 0.5             # 0..1, lower = less operator/spacecraft work
+    mission_impact: str = "minor"         # "none" | "minor" | "major" | "mission-ending"
+    reversibility: str = "easy"           # "trivial" | "easy" | "hard"
 ```
 
 The `ParamSpec` for each parameter is a frozen dataclass:
@@ -2421,6 +2986,10 @@ Procedure.EPS_SHED_LOAD: ProcedureSpec(
     risk_class="low",
     approval_required="operator",
     default_params={"load_reduction_a": 1.0, "duration_s": 3600.0},
+    # D-16 catalog-level editorial fields
+    effort_score=0.30,
+    mission_impact="minor",
+    reversibility="easy",
 ),
 ```
 
@@ -2448,6 +3017,15 @@ The catalog validates itself when `procedures.py` is imported:
   have explicit no-op apply functions for the lifecycle
   symmetry). The `apply_procedure` function handles
   `apply_fn=None` defensively.
+- **D-16 catalog-level editorial fields are valid.** Every
+  entry's `mission_impact` is in the allowed set
+  `("none", "minor", "major", "mission-ending")`, every
+  `reversibility` is in `("trivial", "easy", "hard")`, and
+  every `effort_score` is in `[0.0, 1.0]`. Violations raise
+  `ValueError` at import time. The constant
+  `VALID_MISSION_IMPACTS` and `VALID_REVERSIBILITY` are
+  exported so the test suite can import the allowed sets
+  without re-declaring them.
 
 ### Versioning
 
@@ -2490,7 +3068,9 @@ catalog — both live in `mission_ops/twin/procedures.py` per
 ### 6.1 Scope (as landed)
 
 The twin is a lumped, deterministic state machine implemented in
-`digital-twin/twin/` — **2,791 lines** across 12 Python modules.
+`digital-twin/twin/` — **~3,012 lines** across 12 Python modules
+(was 2,791 lines before the 2026-09-04 D-16/D-17/D-18 additions;
+see §3.1's file inventory table for the per-file deltas).
 The catalog (cause enum, procedure enum, `ProcedureSpec`
 registry, and the 9 `apply_*` functions) lives in the same
 file per D-10: `digital-twin/twin/procedures.py` (712 lines).
@@ -2619,17 +3199,17 @@ parameter schema, preconditions, postconditions, an
 `apply_fn`, a `risk_class`, and an `approval_required`
 field.
 
-| # | Procedure | Risk | Approval | Required params (with bounds) | Default params (Propose uses) |
-|---|---|---|---|---|---|
-| 1 | `eps_shed_non_essential_load` | low | operator | `load_reduction_a: float [0.1, 5.0] A`, `duration_s: float [60, 14400] s` | `{1.0, 3600.0}` |
-| 2 | `eps_increase_charging_priority` | low | operator | `load_reduction_a: float [0.1, 5.0] A`, `duration_s: float [60, 14400] s`, `solar_input_multiplier: float [0.5, 1.0]` (optional) | `{1.0, 3600.0, 1.0}` |
-| 3 | `thermal_enable_heater_backup` | low | operator | `node: str ∈ {battery, payload, electronics}` | `{node: battery}` |
-| 4 | `thermal_throttle_payload` | medium | operator | `payload_power_w: float [0.0, 15.0] W`, `duration_s: float [60, 14400] s` | `{0.0, 3600.0}` |
-| 5 | `adcs_switch_to_safe_hold` | medium | operator | (no params) | `{}` |
-| 6 | `adcs_reset_star_tracker` | medium | operator | `hold_off_s: float [5, 300] s` | `{30.0}` |
-| 7 | `comms_postpone_downlink` | low | **auto** | `postpone_s: float [300, 86400] s` | `{3600.0}` |
-| 8 | `mode_change_to_safe` | **critical** | **director** | (no params) | `{}` |
-| 9 | `wait` | low | **auto** | `duration_s: float [60, 3600] s` | `{600.0}` |
+| # | Procedure | Risk | Approval | Required params (with bounds) | Default params (Propose uses) | Effort | Mission impact | Reversibility |
+|---|---|---|---|---|---|---|---|---|
+| 1 | `eps_shed_non_essential_load` | low | operator | `load_reduction_a: float [0.1, 5.0] A`, `duration_s: float [60, 14400] s` | `{1.0, 3600.0}` | 0.30 | minor | easy |
+| 2 | `eps_increase_charging_priority` | low | operator | `load_reduction_a: float [0.1, 5.0] A`, `duration_s: float [60, 14400] s`, `solar_input_multiplier: float [0.5, 1.0]` (optional) | `{1.0, 3600.0, 1.0}` | 0.35 | minor | easy |
+| 3 | `thermal_enable_heater_backup` | low | operator | `node: str ∈ {battery, payload, electronics}` | `{node: battery}` | 0.15 | none | trivial |
+| 4 | `thermal_throttle_payload` | medium | operator | `payload_power_w: float [0.0, 15.0] W`, `duration_s: float [60, 14400] s` | `{0.0, 3600.0}` | 0.40 | major | easy |
+| 5 | `adcs_switch_to_safe_hold` | medium | operator | (no params) | `{}` | 0.60 | major | hard |
+| 6 | `adcs_reset_star_tracker` | medium | operator | `hold_off_s: float [5, 300] s` | `{30.0}` | 0.45 | minor | easy |
+| 7 | `comms_postpone_downlink` | low | **auto** | `postpone_s: float [300, 86400] s` | `{3600.0}` | 0.10 | minor | trivial |
+| 8 | `mode_change_to_safe` | **critical** | **director** | (no params) | `{}` | 0.85 | mission-ending | hard |
+| 9 | `wait` | low | **auto** | `duration_s: float [60, 3600] s` | `{600.0}` | 0.05 | none | trivial |
 
 **Important — the `risk_class` strings here are not the
 A/B/C/D scheme in §7.** The Phase 1 catalog uses
@@ -2640,6 +3220,48 @@ and the `risk_class` mapping note). The
 scheme (`auto / operator / director`); the A/B/C/D
 scheme is a 4-tier refinement of the `operator` tier
 (see §7 for the planned mapping).
+
+**The three new columns — Effort, Mission impact, Reversibility
+— are the catalog-level editorial fields added in D-16.**
+`effort_score` is a `float` in [0.0, 1.0] (lower is less
+operator/spacecraft work). `mission_impact` is a categorical
+from the allowed set `("none", "minor", "major",
+"mission-ending")`. `reversibility` is a categorical from
+`("trivial", "easy", "hard")`. All three are STATIC catalog
+values, hand-authored per procedure and reviewed in the same
+PR as the procedure's `apply_fn`. They are distinct from
+`risk_class` (which is "how bad if this procedure fails") and
+`approval_required` (which is org-policy routing). The runtime
+`risk_score` from Validate is the *measured* outcome; the
+catalog fields are the *expected* characterization. When the
+two disagree, that is interesting and worth surfacing in the
+runbook.
+
+These three fields serve three purposes:
+
+1. **Propose pre-filter** (D-16, see §2 Stage 3) — `propose()`
+   trims the candidate set to `PROPOSE_TOP_K = 5` by sorting
+   on `(effort_score, mission_impact_score, reversibility_score)`
+   before paying the twin simulation cost.
+2. **Frontend candidates table** (D-18) — the
+   `candidates_ranked` list in the `Proposal` carries these
+   fields per candidate, so the runbook's "Why this procedure"
+   section can render a sortable table showing "we picked the
+   low-effort, easy-to-reverse procedure over the
+   mission-ending one even though both have a low `risk_score`."
+3. **Audit trail** — when the BIBLE §3 runbook schema lands
+   (Phase 3), these fields are part of the runbook JSON
+   alongside the runtime `risk_score`, so an auditor can
+   reconstruct the system's reasoning.
+
+The import-time validation in `procedures.py` rejects any
+registry entry with a `mission_impact` or `reversibility` value
+not in the allowed set, or an `effort_score` outside `[0.0,
+1.0]`. The `test_every_procedure_has_effort_score_in_unit_range`,
+`test_every_procedure_has_valid_mission_impact`, and
+`test_every_procedure_has_valid_reversibility` tests in
+`digital-twin/twin/tests/test_procedures_defaults.py` guard
+against future relaxations.
 
 ### 6.4 The cause → candidate procedure mapping (as landed)
 
@@ -3641,6 +4263,7 @@ architecture, update the BIBLE in the same commit.
 
 ---
 
-*Last updated: 2026-09-01 (post-merge BIBLE update). The
-BIBLE is the project's source of truth. Code may
-drift; the BIBLE must not.*
+*Last updated: 2026-09-04 (D-16/D-17/D-18 — catalog-level
+editorial fields, parallel sims + sim_progress streaming,
+RankedCandidate). The BIBLE is the project's source of
+truth. Code may drift; the BIBLE must not.*

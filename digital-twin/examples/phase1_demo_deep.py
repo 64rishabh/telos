@@ -86,27 +86,39 @@ def _print_diagnose_table(channel: str, candidates: List[Dict[str, Any]]) -> Non
         print(f"    -> winner: {candidates[0]['cause']}")
 
 
-def _run_propose(cause: Cause) -> Tuple[Any, List[Tuple[Procedure, float]]]:
-    """Run Propose on the chosen cause. Return (Proposal, ranked list)."""
+def _run_propose(cause: Cause) -> Tuple[Any, list]:
+    """Run Propose on the chosen cause. Return (Proposal, ranked list).
+
+    Each entry in the returned list is a RankedCandidate with
+    procedure, risk_score, validation, and the catalog-level
+    effort_score / mission_impact / reversibility fields.
+    """
     starting_state = make_default_state()
     proposal = propose(
         cause, starting_state, cause_score=1.5,
         horizon_s=3600.0, dt_s=120.0,  # 1 hour, 2-minute steps
     )
-    ranked = [(p, s) for (p, s, _) in proposal.candidates_ranked]
-    return proposal, ranked
+    return proposal, list(proposal.candidates_ranked)
 
 
-def _print_propose_table(cause: Cause, proposal: Any, ranked: List[Tuple[Procedure, float]]) -> None:
+def _print_propose_table(cause: Cause, proposal: Any, ranked: list) -> None:
     print()
     print("  Propose: candidate procedures for this cause, ranked by risk")
     print()
-    print(f"    {'#':<3s}  {'procedure':<32s}  {'risk':>6s}  default params")
-    print(f"    {'-'*3}  {'-'*32}  {'-'*6}  {'-'*40}")
-    for i, (proc, risk) in enumerate(ranked):
-        params = get_default_params(proc)
+    header = (
+        f"    {'#':<3s}  {'procedure':<32s}  {'risk':>6s}  "
+        f"{'effort':>6s}  {'impact':<14s}  {'reversibility':<12s}  default params"
+    )
+    print(header)
+    print(f"    {'-'*3}  {'-'*32}  {'-'*6}  {'-'*6}  {'-'*14}  {'-'*12}  {'-'*40}")
+    for i, rc in enumerate(ranked):
+        params = get_default_params(rc.procedure)
         params_str = ", ".join(f"{k}={v}" for k, v in params.items()) or "{}"
-        print(f"    {i+1:<3d}  {proc.value:<32s}  {risk:>6.3f}  {params_str}")
+        print(
+            f"    {i+1:<3d}  {rc.procedure.value:<32s}  {rc.risk_score:>6.3f}  "
+            f"{rc.effort_score:>6.2f}  {rc.mission_impact:<14s}  "
+            f"{rc.reversibility:<12s}  {params_str}"
+        )
     print()
     print(f"    -> winner: {proposal.procedure.value}")
     print(f"       verdict: {proposal.verdict.status.value} (risk={proposal.risk_score:.3f}, "

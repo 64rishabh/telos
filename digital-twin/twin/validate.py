@@ -17,7 +17,7 @@ validate_procedure(starting_state, procedure, params, horizon_s)
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 import copy
 import math
 import numpy as np
@@ -63,11 +63,18 @@ def _run_forward(
     eps_params: Optional[Dict] = None,
     thermal_params: Optional[Dict] = None,
     adcs_params: Optional[Dict] = None,
+    on_step: Optional[Callable[[int, int, float, Dict[str, Any]], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Run the twin forward from starting_state for duration_s seconds.
 
     apply_procs: list of (Procedure, params, start_t, end_t) to apply during the run
     fault_schedule: list of fault dicts to schedule
+    on_step: optional callback fired after each physics step with
+        (step_index, total_steps, t_s, current_state). Fires from
+        whichever thread called _run_forward. Consumer must be
+        thread-safe when validate_procedure() is invoked from a
+        ThreadPoolExecutor (Propose's parallel sims do this).
+
     Returns list of state dicts (one per timestep).
 
     Procedures are applied ONCE at their start_t (not every step) — the
@@ -143,6 +150,11 @@ def _run_forward(
         step_adcs(state, dt_s=dt_s, params=adcs_params)
 
         states.append(copy.deepcopy(state))
+        if on_step is not None and step < n_steps:
+            # Fire AFTER appending so the snapshot we hand the consumer
+            # matches the trajectory entry. Skip the final +1 step
+            # (the post-horizon state, conceptually outside the sim).
+            on_step(step, n_steps, t_s, state)
     return states
 
 
@@ -202,6 +214,7 @@ def validate_procedure(
     eps_params: Optional[Dict] = None,
     thermal_params: Optional[Dict] = None,
     adcs_params: Optional[Dict] = None,
+    on_step: Optional[Callable[[int, int, float, Dict[str, Any]], None]] = None,
 ) -> ValidationResult:
     """Project the twin forward with the procedure applied. Returns a
     ValidationResult comparing predicted outcome vs no-action baseline.
@@ -212,6 +225,11 @@ def validate_procedure(
         params: validated parameters for the procedure
         horizon_s: how far forward to project (default 4 hours)
         dt_s: timestep for the projection (default 1 minute — coarser than sim for speed)
+        on_step: optional callback fired after each sim step in BOTH
+            the baseline and predicted runs. Signature is
+            (step_index, total_steps, t_s, current_state). Called from
+            the thread that invoked validate_procedure; consumers must
+            be thread-safe when used from a ThreadPoolExecutor.
 
     Returns:
         ValidationResult with predicted/baseline trajectories, feasibility, risk
@@ -230,6 +248,7 @@ def validate_procedure(
         eps_params=eps_params,
         thermal_params=thermal_params,
         adcs_params=adcs_params,
+        on_step=on_step,
     )
 
     # 3. Run with procedure applied for its full duration
@@ -242,6 +261,7 @@ def validate_procedure(
         eps_params=eps_params,
         thermal_params=thermal_params,
         adcs_params=adcs_params,
+        on_step=on_step,
     )
 
     # 4. Convert state lists to per-field arrays

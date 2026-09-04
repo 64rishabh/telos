@@ -187,6 +187,7 @@ def run_phase1_pipeline(
     channel_hint: Optional[str] = None,
     horizon_s: float = 3600.0,
     dt_s: float = 120.0,
+    progress_cb: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run Diagnose -> Propose -> Verdict for the current injection.
 
@@ -197,13 +198,22 @@ def run_phase1_pipeline(
         channel_hint: if known, the channel the injection targeted;
             used to refine the SymptomEvent for Diagnose
         horizon_s, dt_s: Propose's twin-validation horizon/step
+        progress_cb: optional per-step progress callback forwarded to
+            propose(). Propose fires this from worker threads when
+            running parallel sims. Signature:
+            (procedure_value, step, total, snapshot_state). The
+            bridge does NOT add thread-safety; the caller (the WS
+            server) is responsible for queuing the events onto the
+            right thread (typically via queue.Queue).
 
     Returns:
         JSON-serializable dict with cause, procedure, risk_score,
-        verdict, etc. — ready to drop into the WebSocket broadcast.
-        Returns None if the twin isn't installed (CHESS venv missing
-        on the system Python); the live server keeps running, the
-        operator just doesn't see a verdict this tick.
+        verdict, candidates_ranked (with effort_score /
+        mission_impact / reversibility per candidate), etc. — ready
+        to drop into the WebSocket broadcast. Returns None if the
+        twin isn't installed (CHESS venv missing on the system
+        Python); the live server keeps running, the operator just
+        doesn't see a verdict this tick.
     """
     _ensure_twin_on_path()
     try:
@@ -302,6 +312,7 @@ def run_phase1_pipeline(
     proposal = propose(
         top.cause, starting_state, cause_score=top.score,
         horizon_s=horizon_s, dt_s=dt_s,
+        progress_cb=progress_cb,
     )
 
     return proposal.to_dict()

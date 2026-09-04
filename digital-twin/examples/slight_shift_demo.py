@@ -115,12 +115,20 @@ def main() -> int:
     print()
     print(f"  Stage 3 — Propose: ranked candidate procedures for {top.cause.value}")
     print()
-    print(f"    {'#':<3s}  {'procedure':<32s}  {'risk':>6s}  default params")
-    print(f"    {'-'*3}  {'-'*32}  {'-'*6}  {'-'*40}")
-    for i, (proc, risk, _) in enumerate(proposal.candidates_ranked):
-        params = get_default_params(proc)
+    header = (
+        f"    {'#':<3s}  {'procedure':<32s}  {'risk':>6s}  "
+        f"{'effort':>6s}  {'impact':<14s}  {'reversibility':<12s}  default params"
+    )
+    print(header)
+    print(f"    {'-'*3}  {'-'*32}  {'-'*6}  {'-'*6}  {'-'*14}  {'-'*12}  {'-'*40}")
+    for i, rc in enumerate(proposal.candidates_ranked):
+        params = get_default_params(rc.procedure)
         params_str = ", ".join(f"{k}={v}" for k, v in params.items()) or "{}"
-        print(f"    {i+1:<3d}  {proc.value:<32s}  {risk:>6.3f}  {params_str}")
+        print(
+            f"    {i+1:<3d}  {rc.procedure.value:<32s}  {rc.risk_score:>6.3f}  "
+            f"{rc.effort_score:>6.2f}  {rc.mission_impact:<14s}  "
+            f"{rc.reversibility:<12s}  {params_str}"
+        )
     print()
     print(f"    -> chosen: {proposal.procedure.value} (risk {proposal.risk_score:.3f})")
     print(f"       verdict: {proposal.verdict.status.value}")

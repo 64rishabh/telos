@@ -220,7 +220,7 @@ class ErrorWindow:
         E_seq_max = np.array([max(e_s[e[0] : e[1] + 1]) for e in E_seq])
         E_seq_max_sorted = np.sort(E_seq_max)[::-1]
         E_seq_max_sorted = np.append(E_seq_max_sorted, [non_anom_max])
-        i_to_remove = np.array([])
+        i_to_remove = np.array([], dtype=int)
         for i in range(0, len(E_seq_max_sorted) - 1):
             if (
                 E_seq_max_sorted[i] - E_seq_max_sorted[i + 1]
@@ -230,7 +230,7 @@ class ErrorWindow:
                     np.argwhere(E_seq_max == E_seq_max_sorted[i]),
                 )
             else:
-                i_to_remove = np.array([])
+                i_to_remove = np.array([], dtype=int)
         i_to_remove[::-1].sort()
         if len(i_to_remove) > 0:
             E_seq = np.delete(E_seq, i_to_remove, axis=0)

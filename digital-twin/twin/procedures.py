@@ -223,6 +223,22 @@ class ParamSpec:
 # 4. PROCEDURE SPEC + REGISTRY
 # =============================================================================
 
+# Allowed values for the new catalog-level editorial fields. The
+# import-time validation at the bottom of this file raises on any
+# entry that uses a value outside these sets.
+VALID_MISSION_IMPACTS: tuple = ("none", "minor", "major", "mission-ending")
+VALID_REVERSIBILITY: tuple = ("trivial", "easy", "hard")
+
+
+def _validate_catalog_field(proc_name: str, field_name: str, value: Any, allowed: tuple) -> None:
+    """Raise ValueError if value is not in the allowed set. Used at
+    import time to keep the registry self-consistent."""
+    if value not in allowed:
+        raise ValueError(
+            f"Procedure {proc_name}: {field_name}={value!r} not in {allowed}"
+        )
+
+
 @dataclass
 class ProcedureSpec:
     """Full specification of a procedure: what params it takes, what must
@@ -243,6 +259,25 @@ class ProcedureSpec:
     # Per-cause overrides (T2 in the plan) deferred until the demo
     # shows the cause-agnostic defaults are insufficient.
     default_params: Optional[Dict[str, Any]] = None
+    # Catalog-level editorial signals used by the Propose pre-filter
+    # and surfaced to the frontend for the candidates table demo.
+    # All three are STATIC (hand-authored, go through PR review) and
+    # orthogonal to risk_class and risk_score.
+    #
+    #   effort_score: 0..1, lower = less operator/spacecraft work
+    #     (e.g., wait=0.05, mode_change_to_safe=0.85).
+    #   mission_impact: how much mission capability is lost while
+    #     this procedure is in effect. Independent of risk (a
+    #     low-risk procedure can have major mission impact if it's
+    #     the only way to recover).
+    #   reversibility: how easy it is to undo the procedure's effect
+    #     once started. "trivial" = instant rollback, "easy" = stop
+    #     the procedure and the spacecraft returns to nominal
+    #     within a step or two, "hard" = the procedure's effect
+    #     persists and recovery requires another procedure.
+    effort_score: float = 0.5
+    mission_impact: str = "minor"
+    reversibility: str = "easy"
 
     def validate_params(self, params: dict) -> None:
         """Raises ValueError on first invalid parameter."""
@@ -417,6 +452,9 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
         risk_class="low",
         approval_required="operator",
         default_params={"load_reduction_a": 1.0, "duration_s": 3600.0},
+        effort_score=0.30,
+        mission_impact="minor",
+        reversibility="easy",
     ),
 
     Procedure.EPS_PRIORITIZE_CHARGING: ProcedureSpec(
@@ -454,6 +492,9 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
             "duration_s": 3600.0,
             "solar_input_multiplier": 1.0,
         },
+        effort_score=0.35,
+        mission_impact="minor",
+        reversibility="easy",
     ),
 
     Procedure.THERMAL_ENABLE_BACKUP_HEATER: ProcedureSpec(
@@ -479,6 +520,9 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
         risk_class="low",
         approval_required="operator",
         default_params={"node": "battery"},
+        effort_score=0.15,
+        mission_impact="none",
+        reversibility="trivial",
     ),
 
     Procedure.THERMAL_THROTTLE_PAYLOAD: ProcedureSpec(
@@ -506,6 +550,9 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
         risk_class="medium",  # payload off = mission impact
         approval_required="operator",
         default_params={"payload_power_w": 0.0, "duration_s": 3600.0},
+        effort_score=0.40,
+        mission_impact="major",
+        reversibility="easy",
     ),
 
     Procedure.ADCS_SAFE_HOLD: ProcedureSpec(
@@ -524,6 +571,9 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
         risk_class="medium",  # lose fine pointing, comms may suffer
         approval_required="operator",
         default_params={},
+        effort_score=0.60,
+        mission_impact="major",
+        reversibility="hard",
     ),
 
     Procedure.ADCS_RESET_STAR_TRACKER: ProcedureSpec(
@@ -547,6 +597,9 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
         risk_class="medium",  # brief pointing degradation
         approval_required="operator",
         default_params={"hold_off_s": 30.0},
+        effort_score=0.45,
+        mission_impact="minor",
+        reversibility="easy",
     ),
 
     Procedure.COMMS_POSTPONE_DOWNLINK: ProcedureSpec(
@@ -569,6 +622,9 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
         risk_class="low",
         approval_required="auto",  # routine, can auto-approve
         default_params={"postpone_s": 3600.0},
+        effort_score=0.10,
+        mission_impact="minor",
+        reversibility="trivial",
     ),
 
     Procedure.MODE_CHANGE_TO_SAFE: ProcedureSpec(
@@ -587,6 +643,9 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
         risk_class="critical",  # mission-impacting, last resort
         approval_required="director",  # mission director must approve
         default_params={},
+        effort_score=0.85,
+        mission_impact="mission-ending",
+        reversibility="hard",
     ),
 
     Procedure.WAIT: ProcedureSpec(
@@ -607,9 +666,23 @@ PROCEDURE_REGISTRY: Dict[Procedure, ProcedureSpec] = {
         risk_class="low",
         approval_required="auto",
         default_params={"duration_s": 600.0},
+        effort_score=0.05,
+        mission_impact="none",
+        reversibility="trivial",
     ),
 
 }
+
+
+# Import-time validation: every entry's new catalog fields must be
+# in the allowed sets. Raises on first bad value.
+for _proc, _spec in PROCEDURE_REGISTRY.items():
+    _validate_catalog_field(_proc.value, "mission_impact", _spec.mission_impact, VALID_MISSION_IMPACTS)
+    _validate_catalog_field(_proc.value, "reversibility", _spec.reversibility, VALID_REVERSIBILITY)
+    if not (0.0 <= _spec.effort_score <= 1.0):
+        raise ValueError(
+            f"Procedure {_proc.value}: effort_score={_spec.effort_score!r} not in [0.0, 1.0]"
+        )
 
 
 def get_default_params(procedure: Procedure) -> Dict[str, Any]:

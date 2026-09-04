@@ -2,38 +2,104 @@
 Stage 3 — Propose.
 
 Given a Cause and the current twin state, look up the candidate
-procedures, validate each against the twin, rank by risk_score, and
-return the best one with the full ranking for the runbook.
+procedures, pre-filter by catalog-level signals (cheap, no twin), then
+simulate the top-K in parallel in the digital twin. Rank the simulated
+candidates by risk_score and return the best one with the full ranking
+for the runbook.
 
 The cause -> candidate mapping is hardcoded in twin/procedures.py
-(BIBLE D-10: catalog and twin are one file). Propose adds the
-ranking on top: each candidate is fed to validate_procedure() with
-the procedure's default_params, and the one with the lowest
-risk_score wins.
+(BIBLE D-10: catalog and twin are one file). Propose adds the ranking
+on top: each candidate is fed to validate_procedure() with the
+procedure's default_params, and the one with the lowest risk_score wins.
 
-Per the plan (T1), we use validation-based ranking because it's
-free (90ms for 3 candidates measured) and matches the BIBLE §2
-contract verbatim.
+Catalog-level signals carried in the Proposal (per D-12 "Future
+evolution" + the new effort/impact/reversibility fields):
+  - effort_score: 0..1, lower = less operator/spacecraft work
+  - mission_impact: how much mission capability is lost
+  - reversibility: how easy it is to undo the procedure's effect
+These are STATIC catalog values, hand-authored per procedure, and
+distinct from the runtime risk_score (which is what the twin
+computed). The frontend uses them to label the candidates table
+without re-reading the registry.
 
-Per the plan (T2), default_params live per-procedure in
-PROCEDURE_REGISTRY.default_params. Propose reads them via
-get_default_params(). Per-cause overrides are deferred (T2).
+Validation-based ranking (D-12): the twin computes the risk for each
+candidate. Propose is a thin ranking layer over Validate — it does
+NOT look up by default_procedure_id or risk_class.
 
-Per the plan (T3), we wrap the ValidationResult in a Verdict here
-so the operator sees OK | REJECT | INCONCLUSIVE. Propose is the
-ONLY place that calls to_verdict; the Verdict flows out through
-the WebSocket broadcast unchanged.
+Parallel simulation: when the candidate set has more than one
+procedure, Propose runs validate_procedure() in a ThreadPoolExecutor
+with up to PROPOSE_TOP_K workers. Each worker fires a per-step
+on_step callback (see validate.py) so the bridge/WS server can stream
+simulation progress to the frontend.
 """
 
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from twin.procedures import (
-    Cause, Procedure, get_candidate_procedures, get_default_params,
+    Cause, Procedure, PROCEDURE_REGISTRY, get_candidate_procedures, get_default_params,
 )
 from twin.validate import ValidationResult, validate_procedure
 from twin.verdict import Verdict, to_verdict
+
+
+# Maximum number of candidate procedures we will simulate in the
+# digital twin. Catalog signals (coarse_rank) pre-filter to this
+# before the expensive twin sim runs. Phase 1's largest cause has
+# 3 candidates, so this is just an upper bound; the larger catalog
+# of future phases will exercise the pre-filter for real.
+PROPOSE_TOP_K: int = 5
+
+
+# Lexicographic pre-filter scoring. Lower is better. These three
+# values are summed (not multiplied) so each axis still has weight
+# even when others are zero. The exact weights are catalog-level
+# editorial judgments; see D-12 "Future evolution" for the rationale.
+_MISSION_IMPACT_SCORE: Dict[str, float] = {
+    "none": 0.0,
+    "minor": 0.2,
+    "major": 0.5,
+    "mission-ending": 1.0,
+}
+_REVERSIBILITY_SCORE: Dict[str, float] = {
+    "trivial": 0.0,
+    "easy": 0.1,
+    "hard": 0.4,
+}
+
+
+def _coarse_rank_key(proc: Procedure) -> tuple:
+    """Cheap catalog-level rank key for a procedure. Lower is better.
+
+    Used to pre-filter candidates to PROPOSE_TOP_K before paying the
+    twin simulation cost. The runtime risk_score (computed in
+    validate_procedure) is still the final arbiter.
+    """
+    spec = PROCEDURE_REGISTRY[proc]
+    return (
+        spec.effort_score,
+        _MISSION_IMPACT_SCORE.get(spec.mission_impact, 0.5),
+        _REVERSIBILITY_SCORE.get(spec.reversibility, 0.1),
+    )
+
+
+@dataclass
+class RankedCandidate:
+    """One row in Proposal.candidates_ranked.
+
+    Carries the runtime risk_score (from validate_procedure) alongside
+    the catalog-level editorial signals (effort_score, mission_impact,
+    reversibility) so the frontend can render a sortable candidates
+    table without re-reading the registry.
+    """
+    procedure: Procedure
+    risk_score: float
+    validation: ValidationResult
+    effort_score: float
+    mission_impact: str
+    reversibility: str
 
 
 @dataclass
@@ -53,9 +119,7 @@ class Proposal:
     risk_score: float
     validation: ValidationResult
     verdict: Verdict
-    candidates_ranked: List[Tuple[Procedure, float, ValidationResult]] = field(
-        default_factory=list
-    )
+    candidates_ranked: List[RankedCandidate] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serializable form for the WebSocket broadcast."""
@@ -67,10 +131,52 @@ class Proposal:
             "risk_score": self.risk_score,
             "verdict": self.verdict.to_dict(),
             "candidates_ranked": [
-                {"procedure": p.value, "risk_score": s}
-                for (p, s, _) in self.candidates_ranked
+                {
+                    "procedure": rc.procedure.value,
+                    "risk_score": rc.risk_score,
+                    "effort_score": rc.effort_score,
+                    "mission_impact": rc.mission_impact,
+                    "reversibility": rc.reversibility,
+                }
+                for rc in self.candidates_ranked
             ],
         }
+
+
+def _run_one(
+    proc: Procedure,
+    starting_state: Dict[str, Any],
+    horizon_s: float,
+    dt_s: float,
+    progress_cb: Optional[Callable[[str, int, int, Dict[str, Any]], None]],
+) -> RankedCandidate:
+    """Validate a single candidate procedure in a worker thread.
+
+    Builds an on_step callback that prefixes the procedure name onto
+    the progress event so the consumer (bridge/WS server) can
+    distinguish events from the 5 parallel sims without maintaining
+    a per-thread registry.
+    """
+    params = get_default_params(proc)
+
+    def on_step(step: int, total: int, t_s: float, snapshot: Dict[str, Any]) -> None:
+        if progress_cb is not None:
+            progress_cb(proc.value, step, total, snapshot)
+
+    result = validate_procedure(
+        starting_state, proc, params,
+        horizon_s=horizon_s, dt_s=dt_s,
+        on_step=on_step,
+    )
+    spec = PROCEDURE_REGISTRY[proc]
+    return RankedCandidate(
+        procedure=proc,
+        risk_score=result.risk_score,
+        validation=result,
+        effort_score=spec.effort_score,
+        mission_impact=spec.mission_impact,
+        reversibility=spec.reversibility,
+    )
 
 
 def propose(
@@ -79,6 +185,7 @@ def propose(
     cause_score: float = 1.0,
     horizon_s: float = 3600.0,
     dt_s: float = 120.0,
+    progress_cb: Optional[Callable[[str, int, int, Dict[str, Any]], None]] = None,
 ) -> Proposal:
     """Pick the best procedure for `cause` by twin-validated risk.
 
@@ -93,11 +200,18 @@ def propose(
             for the demo loop; 4h in the integration test)
         dt_s: timestep for the projection (default 2 min for demo,
             1 min in the integration test)
+        progress_cb: optional per-step progress callback fired from
+            the worker thread(s) running each validate_procedure call.
+            Signature: (procedure_value: str, step: int, total: int,
+            snapshot: dict). Used by the bridge/WS server to stream
+            simulation progress to the frontend. Consumer must be
+            thread-safe (typically wraps in queue.Queue).
 
     Returns:
-        Proposal with the winning procedure, the full ranking, and
-        the BIBLE-shaped Verdict. Wall time measured: 30-120ms
-        depending on candidate count and horizon.
+        Proposal with the winning procedure, the full top-K ranking
+        with catalog fields, and the BIBLE-shaped Verdict. Wall time
+        measured: 30-120ms for the demo's 2-3 candidates at the
+        default 1h/120s horizon (now parallel; same latency budget).
     """
     candidates = get_candidate_procedures(cause)
 
@@ -111,6 +225,7 @@ def propose(
             horizon_s=horizon_s, dt_s=dt_s,
         )
         wait_verdict = to_verdict(wait_validation, Procedure.WAIT, cause)
+        wait_spec = PROCEDURE_REGISTRY[Procedure.WAIT]
         return Proposal(
             cause=cause,
             cause_score=cause_score,
@@ -119,36 +234,49 @@ def propose(
             risk_score=wait_validation.risk_score,
             validation=wait_validation,
             verdict=wait_verdict,
-            candidates_ranked=[(Procedure.WAIT, wait_validation.risk_score, wait_validation)],
+            candidates_ranked=[RankedCandidate(
+                procedure=Procedure.WAIT,
+                risk_score=wait_validation.risk_score,
+                validation=wait_validation,
+                effort_score=wait_spec.effort_score,
+                mission_impact=wait_spec.mission_impact,
+                reversibility=wait_spec.reversibility,
+            )],
         )
 
-    # Validate every candidate and rank by risk_score (lower is better).
-    validated: List[Tuple[Procedure, float, ValidationResult]] = []
-    for proc in candidates:
-        params = get_default_params(proc)
-        # validate_procedure() raises ValueError on bad params; the
-        # defaults always validate by construction (see
-        # test_procedures_defaults.py), so this is belt-and-braces.
-        result = validate_procedure(
-            starting_state, proc, params,
-            horizon_s=horizon_s, dt_s=dt_s,
-        )
-        validated.append((proc, result.risk_score, result))
+    # 1. Pre-filter: keep top K by catalog-level signals (cheap, no twin).
+    #    When the candidate set is smaller than PROPOSE_TOP_K, this is
+    #    effectively a stable sort by coarse_rank.
+    scored = [(_coarse_rank_key(p), p) for p in candidates]
+    scored.sort(key=lambda x: x[0])
+    top_k = [p for _, p in scored[:PROPOSE_TOP_K]]
 
-    # Stable sort: equal-risk candidates keep their catalog order,
-    # which is the expert-defined priority from get_candidate_procedures.
-    validated.sort(key=lambda x: x[1])
+    # 2. Simulate all top-K in parallel in the digital twin.
+    #    Each worker calls validate_procedure() (which itself runs the
+    #    twin forward twice — baseline + predicted) and reports
+    #    per-step progress via progress_cb.
+    workers = min(PROPOSE_TOP_K, len(top_k))
+    results: List[RankedCandidate] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # pool.map preserves order of the input iterable
+        for rc in pool.map(
+            lambda p: _run_one(p, starting_state, horizon_s, dt_s, progress_cb),
+            top_k,
+        ):
+            results.append(rc)
 
-    best_proc, best_risk, best_validation = validated[0]
-    best_verdict = to_verdict(best_validation, best_proc, cause)
+    # 3. Sort by risk_score ascending; lowest wins.
+    results.sort(key=lambda x: x.risk_score)
+    best = results[0]
+    best_verdict = to_verdict(best.validation, best.procedure, cause)
 
     return Proposal(
         cause=cause,
         cause_score=cause_score,
-        procedure=best_proc,
-        procedure_params=get_default_params(best_proc),
-        risk_score=best_risk,
-        validation=best_validation,
+        procedure=best.procedure,
+        procedure_params=get_default_params(best.procedure),
+        risk_score=best.risk_score,
+        validation=best.validation,
         verdict=best_verdict,
-        candidates_ranked=validated,
+        candidates_ranked=results,
     )
