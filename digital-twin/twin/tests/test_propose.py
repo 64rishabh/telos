@@ -289,3 +289,133 @@ def test_propose_runs_candidates_in_parallel(fresh_state):
         f"Expected max_workers=3 (one per candidate), got {submitted[0]}. "
         f"Regression: top-K filter or worker sizing broken."
     )
+
+
+# ----- 13. Multi-axis lexicographic ranking -----------------------
+
+def test_propose_ranks_by_multi_axis_key(fresh_state):
+    """For THERMAL_HEATER_STUCK_ON (1 candidate), the ranking is
+    trivially single-element, so we exercise the multi-axis sort
+    on a multi-candidate cause where the catalog fields dominate
+    over risk_score.
+
+    Concretely: EPS_INTERNAL_R_DEGRADATION has 3 candidates. We
+    patch the validate_procedure to return a fake risk_score for
+    each procedure so the rank_key differs on impact+effort before
+    risk is consulted. The winner must be the one with the lowest
+    mission_impact_score + effort_score tuple, regardless of
+    which procedure has the lowest risk_score.
+    """
+    import twin.propose as propose_mod
+    from twin.validate import validate_procedure as orig_validate
+    from twin.procedures import get_default_params
+    from twin.state import make_default_state
+
+    # Map each candidate to a hand-picked risk_score so the lex
+    # comparison is forced to consult the catalog fields, not risk.
+    # mode_change_to_safe has highest impact (1.0) and highest
+    # effort (0.85) -> worst on first two axes -> should NOT win,
+    # even with the lowest risk_score.
+    risk_overrides = {
+        "eps_shed_non_essential_load": 0.40,             # low impact, low effort, MEDIUM risk
+        "eps_increase_charging_priority": 0.30,          # low impact, low effort, LOW risk
+        "mode_change_to_safe": 0.05,                     # HIGH impact, HIGH effort, LOWEST risk
+    }
+
+    def patched_validate(starting_state, procedure, params, **kwargs):
+        result = orig_validate(starting_state, procedure, params, **kwargs)
+        # Force risk_score to the override, regardless of what the
+        # twin sim produced.
+        from dataclasses import replace
+        return replace(result, risk_score=risk_overrides[procedure.value])
+
+    orig_validate_in_mod = propose_mod.validate_procedure
+    propose_mod.validate_procedure = patched_validate
+    try:
+        proposal = propose(
+            Cause.EPS_INTERNAL_R_DEGRADATION, fresh_state,
+            horizon_s=600.0, dt_s=60.0,
+        )
+    finally:
+        propose_mod.validate_procedure = orig_validate_in_mod
+
+    # mode_change_to_safe has risk=0.05 (lowest!) but its catalog
+    # fields (mission_impact=mission-ending, effort=0.85) should
+    # push it to the bottom under the lexicographic key. The
+    # winner is the candidate with the lowest mission_impact
+    # AND lowest effort among the simulated set.
+    ranked_procs = [rc.procedure.value for rc in proposal.candidates_ranked]
+    # Whichever of eps_shed_non_essential_load or
+    # eps_increase_charging_priority has the lower risk_score
+    # wins (catalog fields are equal between them).
+    # We don't pin the exact winner (depends on risk overrides);
+    # we just assert mode_change_to_safe is NOT the winner.
+    assert proposal.procedure.value != "mode_change_to_safe", (
+        f"mode_change_to_safe should lose on catalog fields, "
+        f"not on risk_score. Got winner={proposal.procedure.value}"
+    )
+    # And confirm the candidates_ranked is sorted by _rank_key.
+    keys = [propose_mod._rank_key(rc) for rc in proposal.candidates_ranked]
+    assert keys == sorted(keys), (
+        f"candidates_ranked not sorted by _rank_key: {keys}"
+    )
+
+
+def test_propose_winner_passes_rank_key(fresh_state):
+    """Proposal.winner_rank_key must equal _rank_key(winner)."""
+    proposal = propose(
+        Cause.THERMAL_HEATER_STUCK_OFF, fresh_state,
+        horizon_s=600.0, dt_s=60.0,
+    )
+    from twin import propose as pm
+    winner_rc = next(rc for rc in proposal.candidates_ranked
+                     if rc.procedure == proposal.procedure)
+    expected = pm._rank_key(winner_rc)
+    assert proposal.winner_rank_key == expected
+    # And to_dict() carries it.
+    assert "winner_rank_key" in proposal.to_dict()
+    assert proposal.to_dict()["winner_rank_key"] == list(expected)
+
+
+def test_propose_risk_score_is_tiebreaker(fresh_state):
+    """Two candidates identical on impact/effort/reversibility
+    must be ordered by risk_score. We use single-candidate cause
+    and assert the rank_key's last component is the risk_score."""
+    from twin import propose as pm
+    proposal = propose(
+        Cause.THERMAL_HEATER_STUCK_ON, fresh_state,
+        horizon_s=600.0, dt_s=60.0,
+    )
+    # Single-candidate: the only element of candidates_ranked
+    # IS the winner. The rank_key's last component is its
+    # risk_score, which IS the tie-breaker.
+    rc = proposal.candidates_ranked[0]
+    key = pm._rank_key(rc)
+    assert key[3] == rc.risk_score, "rank_key[3] must be risk_score"
+    assert proposal.winner_rank_key[3] == rc.risk_score
+
+
+def test_propose_ranking_in_to_dict_uses_multi_axis(fresh_state):
+    """candidates_ranked in to_dict() must be ordered by _rank_key,
+    not by risk_score. Verify with THERMAL_HEATER_STUCK_OFF (2
+    candidates whose catalog fields are equal except mission_impact,
+    so the rank_key is decided on the first axis; risk_score is
+    not consulted)."""
+    from twin import propose as pm
+    proposal = propose(
+        Cause.THERMAL_HEATER_STUCK_OFF, fresh_state,
+        horizon_s=600.0, dt_s=60.0,
+    )
+    d = proposal.to_dict()
+    serialized = d["candidates_ranked"]
+    # Reconstruct _rank_key for each entry from the catalog fields +
+    # the carried risk_score.
+    keys = [(
+        pm._MISSION_IMPACT_SCORE.get(e["mission_impact"], 0.5),
+        e["effort_score"],
+        pm._REVERSIBILITY_SCORE.get(e["reversibility"], 0.1),
+        e["risk_score"],
+    ) for e in serialized]
+    assert keys == sorted(keys), (
+        f"to_dict() ordering violated multi-axis key: {keys}"
+    )

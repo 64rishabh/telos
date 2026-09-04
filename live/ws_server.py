@@ -23,12 +23,13 @@ import json
 import logging
 import os
 import queue
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -36,6 +37,7 @@ from . import config as cfg
 from .error_stream import ErrorStream
 from .generator import SyntheticGenerator
 from .model_runner import LSTMRunner
+from .runbook_store import RunbookStore
 from .twin_bridge import inject_fault, run_phase1_pipeline, CHANNEL_TO_SUBSYSTEM
 
 logger = logging.getLogger("live.ws")
@@ -43,6 +45,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+def _now_unix() -> float:
+    """Single source of truth for current time (Unix seconds)."""
+    return time.time()
 
 
 class AppState:
@@ -89,6 +96,14 @@ class AppState:
         # the next tick message as the "sim_progress" field. Bounded
         # so a runaway sim can't OOM the process.
         self.sim_progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=2000)
+        # D-19 runbook store: every /inject_twin_fault pushes a
+        # runbook here. The frontend's /runbook page reads from it
+        # across page refreshes.
+        self.runbook_store: RunbookStore = RunbookStore()
+        # The most recent runbook_id minted. The producer loop
+        # surfaces it on the next alert tick so the dashboard can
+        # link to the runbook page.
+        self.latest_runbook_id: Optional[str] = None
 
     def shutdown(self) -> None:
         self.running = False
@@ -290,24 +305,91 @@ def create_app(model_path: Optional[str] = None) -> FastAPI:
             channel_hint=channel,
             horizon_s=horizon_s, dt_s=dt_s,
             progress_cb=_make_progress_cb(),
+            fault_id=inject_resp["fault_id"],
+            injection_meta={
+                "kind": kind,
+                "channel": channel,
+                "magnitude": magnitude,
+                "horizon_s": horizon_s,
+                "dt_s": dt_s,
+                "injected_at_unix": _now_unix(),
+            },
         )
         if verdict is not None:
-            state.latest_verdict = verdict
-            state.latest_fault_id = inject_resp["fault_id"]
-            inject_resp["verdict"] = verdict
+            proposal_dict = verdict.get("proposal")
+            runbook = verdict.get("runbook")
+            if proposal_dict is not None:
+                state.latest_verdict = proposal_dict
+                state.latest_fault_id = inject_resp["fault_id"]
+                inject_resp["verdict"] = proposal_dict
+            # Persist the runbook (if the builder succeeded) and
+            # stamp its id on both the inject response and the
+            # latest_runbook_id (so the WS producer loop can attach
+            # it to the next alert tick).
+            runbook_id = None
+            if runbook is not None:
+                runbook_id = state.runbook_store.add(runbook)
+                state.latest_runbook_id = runbook_id
+            inject_resp["runbook_id"] = runbook_id
         else:
             inject_resp["verdict"] = None
+            inject_resp["runbook_id"] = None
 
         logger.info(
-            "[inject_twin_fault] %s -> %s verdict=%s",
+            "[inject_twin_fault] %s -> %s verdict=%s runbook_id=%s",
             inject_resp["fault_id"], inject_resp["fault_type"],
             (verdict or {}).get("verdict", {}).get("status") if verdict else "NONE",
+            inject_resp.get("runbook_id"),
         )
         return JSONResponse(inject_resp)
 
     @app.get("/inject")
     async def inject_get(request: Request):
         return await inject_endpoint(request)
+
+    # ----------------------------------------------------------------
+    # Runbook API (D-19)
+    # ----------------------------------------------------------------
+    # Three endpoints, all read-only:
+    #   GET /api/runbooks                     -> list (most recent first)
+    #   GET /api/runbooks/{runbook_id}        -> full payload
+    #   GET /api/runbooks/{runbook_id}/trajectory -> just the 3-field arrays
+    # The store is in-process; these endpoints are local to the live
+    # server. Phase 2+ will mirror writes to a durable store.
+
+    @app.get("/api/runbooks")
+    async def list_runbooks(limit: int = Query(20, ge=1)):
+        """List recent runbooks (most recent first).
+
+        Each entry is a summary view (no trajectory, no symptom window).
+        The full payload is fetched by id.
+        """
+        from .runbook_builder import summary_view
+        entries = state.runbook_store.list_recent(limit=limit)
+        return JSONResponse([summary_view(e) for e in entries])
+
+    @app.get("/api/runbooks/{runbook_id}")
+    async def get_runbook(runbook_id: str):
+        """Fetch the full runbook payload by id. 404 if not found."""
+        rb = state.runbook_store.get(runbook_id)
+        if rb is None:
+            raise HTTPException(404, f"runbook {runbook_id} not found")
+        return JSONResponse(rb)
+
+    @app.get("/api/runbooks/{runbook_id}/trajectory")
+    async def get_runbook_trajectory(runbook_id: str):
+        """Lightweight endpoint for the trajectory canvases.
+
+        Returns just the 3-field arrays (battery_soc, battery_temp_c,
+        payload_temp_c) with baseline+predicted series. Lets the
+        frontend poll the chart data without re-downloading the full
+        payload on every tick.
+        """
+        from .runbook_builder import trajectory_view
+        rb = state.runbook_store.get(runbook_id)
+        if rb is None:
+            raise HTTPException(404, f"runbook {runbook_id} not found")
+        return JSONResponse(trajectory_view(rb))
 
     async def _broadcast(message: dict) -> None:
         if not state.clients:
@@ -353,6 +435,7 @@ def create_app(model_path: Optional[str] = None) -> FastAPI:
             "anomaly": None,
             "twin_verdict": None,
             "sim_progress": sim_progress,
+            "runbook_id": state.latest_runbook_id,
         }
         if alerts:
             latest = max(alerts, key=lambda a: a.score)

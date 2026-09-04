@@ -74,14 +74,36 @@ def _coarse_rank_key(proc: Procedure) -> tuple:
     """Cheap catalog-level rank key for a procedure. Lower is better.
 
     Used to pre-filter candidates to PROPOSE_TOP_K before paying the
-    twin simulation cost. The runtime risk_score (computed in
-    validate_procedure) is still the final arbiter.
+    twin simulation cost. Mirrors _rank_key but does not include the
+    runtime risk_score (which only exists after the twin sim runs).
     """
     spec = PROCEDURE_REGISTRY[proc]
     return (
-        spec.effort_score,
         _MISSION_IMPACT_SCORE.get(spec.mission_impact, 0.5),
+        spec.effort_score,
         _REVERSIBILITY_SCORE.get(spec.reversibility, 0.1),
+    )
+
+
+def _rank_key(rc: "RankedCandidate") -> tuple:
+    """Multi-axis lexicographic rank key for a simulated candidate.
+
+    Lower is better. Order:
+      1. mission_impact_score  (lowest first: "none" < "minor" < "major" < "mission-ending")
+      2. effort_score          (lowest first: cheapest operator/spacecraft work)
+      3. reversibility_score   (lowest first: "trivial" < "easy" < "hard")
+      4. risk_score            (lowest first: runtime twin-computed risk; tie-breaker)
+
+    Risk is consulted ONLY when the first three axes are tied. The
+    lexicographic structure means a procedure that is "cheap" but
+    "high risk" loses to a procedure that is "expensive" but
+    "low impact" — exactly the BIBLE §2 / D-12 evolution.
+    """
+    return (
+        _MISSION_IMPACT_SCORE.get(rc.mission_impact, 0.5),
+        rc.effort_score,
+        _REVERSIBILITY_SCORE.get(rc.reversibility, 0.1),
+        rc.risk_score,
     )
 
 
@@ -120,6 +142,12 @@ class Proposal:
     validation: ValidationResult
     verdict: Verdict
     candidates_ranked: List[RankedCandidate] = field(default_factory=list)
+    # The multi-axis lexicographic key that picked the winner. Stored
+    # on the Proposal so the runbook can show the operator which axis
+    # decided the comparison. The full list of all candidates' keys
+    # is reconstructable from candidates_ranked (each RankedCandidate
+    # carries the catalog fields; risk_score is the runtime value).
+    winner_rank_key: tuple = field(default_factory=tuple)
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serializable form for the WebSocket broadcast."""
@@ -140,6 +168,7 @@ class Proposal:
                 }
                 for rc in self.candidates_ranked
             ],
+            "winner_rank_key": list(self.winner_rank_key),
         }
 
 
@@ -242,6 +271,12 @@ def propose(
                 mission_impact=wait_spec.mission_impact,
                 reversibility=wait_spec.reversibility,
             )],
+            winner_rank_key=(
+                _MISSION_IMPACT_SCORE.get(wait_spec.mission_impact, 0.5),
+                wait_spec.effort_score,
+                _REVERSIBILITY_SCORE.get(wait_spec.reversibility, 0.1),
+                wait_validation.risk_score,
+            ),
         )
 
     # 1. Pre-filter: keep top K by catalog-level signals (cheap, no twin).
@@ -265,8 +300,10 @@ def propose(
         ):
             results.append(rc)
 
-    # 3. Sort by risk_score ascending; lowest wins.
-    results.sort(key=lambda x: x.risk_score)
+    # 3. Multi-axis lexicographic sort. Lowest rank_key wins.
+    #    Order: (mission_impact, effort_score, reversibility, risk_score).
+    #    See _rank_key() docstring for the rationale.
+    results.sort(key=_rank_key)
     best = results[0]
     best_verdict = to_verdict(best.validation, best.procedure, cause)
 
@@ -279,4 +316,5 @@ def propose(
         validation=best.validation,
         verdict=best_verdict,
         candidates_ranked=results,
+        winner_rank_key=_rank_key(best),
     )

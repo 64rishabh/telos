@@ -188,6 +188,8 @@ def run_phase1_pipeline(
     horizon_s: float = 3600.0,
     dt_s: float = 120.0,
     progress_cb: Optional[Any] = None,
+    fault_id: Optional[str] = None,
+    injection_meta: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run Diagnose -> Propose -> Verdict for the current injection.
 
@@ -205,15 +207,25 @@ def run_phase1_pipeline(
             bridge does NOT add thread-safety; the caller (the WS
             server) is responsible for queuing the events onto the
             right thread (typically via queue.Queue).
+        fault_id: the FaultScheduler-injected id (e.g. "F-003"). If
+            provided, the bridge stamps it on the returned runbook.
+        injection_meta: dict of {kind, channel, magnitude,
+            injected_at_unix} from the HTTP request. Stamped on the
+            runbook's "injection" block. May be None for offline
+            tests.
 
     Returns:
-        JSON-serializable dict with cause, procedure, risk_score,
-        verdict, candidates_ranked (with effort_score /
-        mission_impact / reversibility per candidate), etc. — ready
-        to drop into the WebSocket broadcast. Returns None if the
-        twin isn't installed (CHESS venv missing on the system
-        Python); the live server keeps running, the operator just
-        doesn't see a verdict this tick.
+        Dict with two keys:
+          - "proposal": JSON-serializable dict (the proposal.to_dict()
+            output). The WS server attaches this to the next alert
+            tick's broadcast and returns it in the inject response.
+          - "runbook": the full enriched runbook payload (without
+            runbook_id, which the store mints). The WS server pushes
+            this into the runbook store and attaches the minted id
+            to the WS message.
+        Returns None if the twin isn't installed (CHESS venv missing
+        on the system Python); the live server keeps running, the
+        operator just doesn't see a verdict this tick.
     """
     _ensure_twin_on_path()
     try:
@@ -223,12 +235,17 @@ def run_phase1_pipeline(
         from twin.diagnose import SymptomEvent, diagnose
         from twin.propose import propose
         from twin.state import make_default_state
-        from twin.procedures import Cause
+        from twin.procedures import (
+            Cause, Procedure, PROCEDURE_REGISTRY, get_candidate_procedures,
+        )
     except Exception as e:
         logger.warning(
             "[bridge] twin import failed (%s); skipping Phase 1 pipeline", e
         )
         return None
+
+    import time as _time
+    pipeline_timestamps: Dict[str, float] = {}
 
     # Build the symptom window. The bridge's contract (BIBLE §2 +
     # Phase 1 design): the pipeline is *predictive* — it runs at
@@ -278,6 +295,7 @@ def run_phase1_pipeline(
             symptom_events.append(SymptomEvent(**d))
 
     # Diagnose.
+    pipeline_timestamps["stage_2_at_unix"] = _time.time()
     candidates = diagnose(symptom_events)
     if not candidates:
         return None
@@ -287,7 +305,7 @@ def run_phase1_pipeline(
         # Return a BIBLE-shape-consistent dict (matches the keys
         # that proposal.to_dict() produces) so callers can rely on
         # the same shape regardless of whether a cause was found.
-        return {
+        proposal_dict = {
             "cause": Cause.NO_FAULT_DETECTED.value,
             "cause_score": top.score,
             "procedure": None,
@@ -303,19 +321,129 @@ def run_phase1_pipeline(
             },
             "candidates_ranked": [],
         }
+        # Still build a runbook so the operator sees the "no fault"
+        # outcome in the runbook list; it has no candidates and no
+        # trajectory.
+        try:
+            from . import runbook_builder
+            runbook = runbook_builder.build_runbook(
+                fault_id=fault_id or "F-000",
+                fault_type=fault_type,
+                injection=injection_meta or {},
+                pipeline_timestamps=pipeline_timestamps,
+                proposal_dict=proposal_dict,
+                cause_catalog={
+                    "affected_subsystems": Cause.NO_FAULT_DETECTED.affected_subsystems(),
+                    "expected_channels": Cause.NO_FAULT_DETECTED.expected_channels(),
+                },
+                candidates_considered=[],
+                symptom_window=[
+                    {
+                        "channel": e.channel, "subsystem": e.subsystem,
+                        "kind": e.kind, "score": e.score, "seq": list(e.seq),
+                        "ts": e.ts,
+                    }
+                    for e in symptom_events
+                ],
+                horizon_s=horizon_s, dt_s=dt_s,
+                primary_subsystem=(
+                    CHANNEL_TO_SUBSYSTEM.get(channel_hint) if channel_hint else None
+                ),
+                channel=channel_hint,
+            )
+        except Exception as e:
+            logger.warning("[bridge] runbook build failed (no-fault path): %s", e)
+            runbook = None
+        return {"proposal": proposal_dict, "runbook": runbook}
 
     # Propose. The starting_state for validate_procedure is the
     # default state; per the plan T2, the defaults are safe across
     # a range of starting conditions for the demo. A future phase
     # can pipe the actual post-fault state through here.
+    pipeline_timestamps["stage_3_at_unix"] = _time.time()
     starting_state = make_default_state()
     proposal = propose(
         top.cause, starting_state, cause_score=top.score,
         horizon_s=horizon_s, dt_s=dt_s,
         progress_cb=progress_cb,
     )
+    pipeline_timestamps["stage_4_at_unix"] = _time.time()
 
-    return proposal.to_dict()
+    proposal_dict = proposal.to_dict()
+
+    # Build candidates_considered: every Procedure the cause maps to,
+    # each with its spec attached so the runbook builder can pull
+    # description / risk_class / approval_required.
+    all_candidate_procs = get_candidate_procedures(top.cause)
+    simulated_names = {rc.procedure for rc in proposal.candidates_ranked}
+    candidates_considered: List[Dict[str, Any]] = []
+    for proc in all_candidate_procs:
+        spec = PROCEDURE_REGISTRY[proc]
+        # The simulated subset also carries risk_score; the builder
+        # needs both the catalog spec AND the runtime score.
+        risk_score = None
+        for rc in proposal.candidates_ranked:
+            if rc.procedure == proc:
+                risk_score = float(rc.risk_score)
+                break
+        candidates_considered.append({
+            "procedure": proc.value,
+            "effort_score": spec.effort_score,
+            "mission_impact": spec.mission_impact,
+            "reversibility": spec.reversibility,
+            "risk_score": risk_score,
+            "_spec": {
+                "description": spec.description,
+                "risk_class": spec.risk_class,
+                "approval_required": spec.approval_required,
+                "effort_score": spec.effort_score,
+                "mission_impact": spec.mission_impact,
+                "reversibility": spec.reversibility,
+            },
+        })
+
+    # Pull the predicted/baseline trajectories from the winner's
+    # ValidationResult so the runbook canvas has data to render.
+    winner_validation = proposal.validation
+    predicted_traj = getattr(winner_validation, "predicted_trajectory", None)
+    baseline_traj = getattr(winner_validation, "baseline_trajectory", None)
+
+    try:
+        from . import runbook_builder
+        runbook = runbook_builder.build_runbook(
+            fault_id=fault_id or "F-000",
+            fault_type=fault_type,
+            injection=injection_meta or {},
+            pipeline_timestamps=pipeline_timestamps,
+            proposal_dict=proposal_dict,
+            cause_catalog={
+                "affected_subsystems": list(top.cause.affected_subsystems()),
+                "expected_channels": list(top.cause.expected_channels()),
+            },
+            candidates_considered=candidates_considered,
+            symptom_window=[
+                {
+                    "channel": e.channel, "subsystem": e.subsystem,
+                    "kind": e.kind, "score": e.score, "seq": list(e.seq),
+                    "ts": e.ts,
+                }
+                for e in symptom_events
+            ],
+            predicted_trajectory=predicted_traj,
+            baseline_trajectory=baseline_traj,
+            horizon_s=horizon_s, dt_s=dt_s,
+            primary_subsystem=(
+                CHANNEL_TO_SUBSYSTEM.get(channel_hint) if channel_hint else None
+            ),
+            channel=channel_hint,
+        )
+    except Exception as e:
+        # The runbook is a derived view; if its builder raises
+        # (e.g. numpy in scope issues), don't fail the whole pipeline.
+        logger.warning("[bridge] runbook build failed: %s", e)
+        runbook = None
+
+    return {"proposal": proposal_dict, "runbook": runbook}
 
 
 def inject_fault(
