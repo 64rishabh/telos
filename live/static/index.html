@@ -2,227 +2,920 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Live Telemanom — Streaming Anomaly Detection</title>
+<title>telos — multi-agent satellite anomaly operations</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root {
-    --bg: #0e1117;
-    --panel: #161b22;
-    --grid: #30363d;
-    --text: #c9d1d9;
-    --muted: #8b949e;
-    --actual: #58a6ff;
-    --pred: #3fb950;
-    --error: #d29922;
-    --anomaly: #f85149;
+    --bg-paper: #f5f1e8;
+    --text-main: #1a1a1a;
+    --accent-orange: #b8500d;
+    --ink-teal: #2e5266;
+    --pencil-grey: #7c7c7c;
   }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
-  header { padding: 14px 22px; border-bottom: 1px solid var(--grid); display: flex; align-items: center; gap: 16px; }
-  header h1 { font-size: 16px; font-weight: 600; margin: 0; }
-  header .status { font-size: 12px; color: var(--muted); }
-  header .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #21262d; font-size: 11px; color: var(--muted); }
-  .pill.live { background: #1f6f3a; color: #3fb950; }
-  main { padding: 16px 22px; display: grid; gap: 12px; }
-  .panel { background: var(--panel); border: 1px solid var(--grid); border-radius: 8px; padding: 12px 14px; }
-  .panel h2 { margin: 0 0 8px 0; font-size: 13px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
-  canvas { display: block; width: 100%; height: 180px; }
-  .legend { display: flex; gap: 18px; font-size: 12px; color: var(--muted); }
-  .legend span { display: inline-flex; align-items: center; gap: 6px; }
-  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
-  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
-  .controls a, .controls button { background: #21262d; color: var(--text); border: 1px solid var(--grid); border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; text-decoration: none; }
-  .controls a:hover, .controls button:hover { background: #30363d; }
-  .controls .spike { border-color: var(--anomaly); }
-  footer { padding: 8px 22px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--grid); }
-  #alertLog { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; max-height: 140px; overflow-y: auto; }
-  #alertLog .row { color: var(--anomaly); }
-  #alertLog .row .t { color: var(--muted); }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background-color: var(--bg-paper);
+    background-image: repeating-linear-gradient(
+      transparent, transparent 27px,
+      rgba(124, 124, 124, 0.08) 27px, rgba(124, 124, 124, 0.08) 28px
+    );
+    animation: notebook-drift 8s linear infinite;
+    color: var(--text-main);
+    font-family: "Söhne", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 17px;
+    line-height: 1.65;
+    font-feature-settings: "kern" 1, "liga" 1;
+    -webkit-font-smoothing: antialiased;
+  }
+  @keyframes notebook-drift {
+    from { background-position: 0 0; }
+    to { background-position: 0 28px; }
+  }
+
+  /* the bound register */
+  .register {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 64px 32px 96px 32px;
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    column-gap: 24px;
+  }
+
+  /* every section's left column marker */
+  .marker {
+    font-family: "JetBrains Mono", "Söhne", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--accent-orange);
+    line-height: 1.1;
+    padding-top: 4px;
+    text-align: right;
+    border-right: 1px solid var(--pencil-grey);
+    padding-right: 16px;
+    user-select: none;
+  }
+  .marker .label {
+    display: block;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--pencil-grey);
+    margin-top: 6px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  /* hero */
+  .hero { padding-top: 8px; }
+  h1 {
+    font-size: 48px;
+    line-height: 1.1;
+    font-weight: 700;
+    margin: 0 0 8px 0;
+    letter-spacing: -0.01em;
+  }
+  .hero .lede {
+    font-size: 17px;
+    color: var(--text-main);
+    margin: 0 0 24px 0;
+    max-width: 56ch;
+  }
+  .hero .meta {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 24px;
+    font-family: "JetBrains Mono", "Söhne", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-main);
+    border-top: 1px solid var(--pencil-grey);
+    border-bottom: 1px solid var(--pencil-grey);
+    padding: 14px 0;
+    margin: 24px 0 0 0;
+  }
+  .hero .meta dt {
+    color: var(--pencil-grey);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 11px;
+    display: inline;
+  }
+  .hero .meta dd {
+    display: inline;
+    margin: 0;
+  }
+  .hero .meta dl { margin: 0; }
+  .hero .meta .row { padding: 2px 0; }
+
+  /* section headings */
+  h2 {
+    font-size: 24px;
+    font-weight: 600;
+    line-height: 1.2;
+    margin: 56px 0 16px 0;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--pencil-grey);
+  }
+  h3 {
+    font-size: 18px;
+    font-weight: 700;
+    margin: 28px 0 8px 0;
+    line-height: 1.3;
+  }
+  h4 {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 18px 0 6px 0;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0;
+    text-transform: uppercase;
+    color: var(--ink-teal);
+  }
+
+  p { margin: 0 0 14px 0; }
+  p + p { margin-top: 0; }
+  a {
+    color: var(--text-main);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1px;
+  }
+  a:hover { color: var(--accent-orange); }
+
+  /* the table of contents / list pages */
+  .toc { list-style: none; padding: 0; margin: 0 0 24px 0; }
+  .toc li {
+    display: grid;
+    grid-template-columns: 48px 1fr auto;
+    column-gap: 12px;
+    align-items: baseline;
+    padding: 6px 0;
+    border-bottom: 1px dashed rgba(124, 124, 124, 0.35);
+  }
+  .toc li:last-child { border-bottom: 0; }
+  .toc .num {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--pencil-grey);
+  }
+  .toc .title { font-size: 16px; }
+  .toc .pg {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--pencil-grey);
+  }
+
+  /* the pipeline diagram (SVG) */
+  .pipeline {
+    width: 100%;
+    height: auto;
+    margin: 20px 0 8px 0;
+    display: block;
+  }
+  .pipeline-caption {
+    font-size: 13px;
+    color: var(--pencil-grey);
+    font-style: italic;
+    margin: 0 0 16px 0;
+  }
+
+  /* the subsystem table */
+  table.subsystems {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 16px 0;
+    font-size: 15px;
+  }
+  table.subsystems th,
+  table.subsystems td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(124, 124, 124, 0.35);
+    vertical-align: top;
+  }
+  table.subsystems th {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--pencil-grey);
+    font-weight: 600;
+    border-bottom: 1px solid var(--text-main);
+  }
+  table.subsystems td.mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+  }
+
+  /* the cause catalog list */
+  .catalog {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 24px;
+    row-gap: 0;
+    margin: 12px 0 16px 0;
+  }
+  .catalog .item {
+    padding: 10px 0;
+    border-bottom: 1px dashed rgba(124, 124, 124, 0.35);
+  }
+  .catalog .item .id {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--accent-orange);
+    display: block;
+    margin-bottom: 2px;
+  }
+  .catalog .item .name {
+    font-size: 15px;
+  }
+
+  /* procedure catalog list (single column) */
+  .procedures {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0 16px 0;
+  }
+  .procedures li {
+    padding: 8px 0;
+    border-bottom: 1px dashed rgba(124, 124, 124, 0.35);
+    display: grid;
+    grid-template-columns: 24px 1fr;
+    column-gap: 12px;
+    align-items: baseline;
+  }
+  .procedures li:last-child { border-bottom: 0; }
+  .procedures .id {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--pencil-grey);
+  }
+  .procedures .name { font-size: 15px; }
+
+  /* decisions / quote block */
+  .aside {
+    border-left: 2px solid var(--accent-orange);
+    padding: 4px 0 4px 16px;
+    margin: 16px 0;
+    font-size: 16px;
+    color: var(--text-main);
+  }
+  .aside .who {
+    display: block;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--pencil-grey);
+    margin-top: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  /* data block (monospace stat strip) */
+  .data {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 15px;
+    line-height: 1.5;
+    background: transparent;
+    padding: 12px 0;
+    border-top: 1px solid var(--pencil-grey);
+    border-bottom: 1px solid var(--pencil-grey);
+    margin: 16px 0;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0;
+  }
+  .data .stat { padding: 0 16px; border-right: 1px dashed rgba(124, 124, 124, 0.45); }
+  .data .stat:last-child { border-right: 0; }
+  .data .stat .v { display: block; font-size: 22px; color: var(--accent-orange); font-weight: 700; }
+  .data .stat .k { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--pencil-grey); margin-top: 2px; }
+
+  /* footer colophon */
+  .colophon {
+    margin-top: 64px;
+    padding-top: 16px;
+    border-top: 1px solid var(--text-main);
+    font-size: 13px;
+    color: var(--pencil-grey);
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    line-height: 1.6;
+  }
+  .colophon .row { padding: 2px 0; }
+  .colophon .row .k { display: inline-block; width: 110px; color: var(--pencil-grey); }
+
+  /* constraints callout */
+  .constraints {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0 16px 0;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .constraints li {
+    display: grid;
+    grid-template-columns: 200px 110px 1fr;
+    column-gap: 12px;
+    padding: 4px 0;
+    border-bottom: 1px dotted rgba(124, 124, 124, 0.4);
+  }
+  .constraints li:last-child { border-bottom: 0; }
+  .constraints .field { color: var(--text-main); }
+  .constraints .range { color: var(--accent-orange); }
+  .constraints .note { color: var(--pencil-grey); }
+
+  /* small handwritten annotation */
+  .annot {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--accent-orange);
+    transform: rotate(-1.5deg);
+    display: inline-block;
+    margin-left: 8px;
+  }
+
+  /* responsive */
+  @media (max-width: 720px) {
+    .register { grid-template-columns: 1fr; padding: 32px 20px 64px 20px; column-gap: 0; }
+    .marker { text-align: left; border-right: 0; border-bottom: 1px solid var(--pencil-grey); padding: 0 0 8px 0; margin-bottom: 16px; }
+    .marker .label { display: inline; margin-left: 8px; }
+    h1 { font-size: 34px; }
+    .catalog { grid-template-columns: 1fr; }
+    .data { grid-template-columns: 1fr 1fr; }
+    .data .stat { border-right: 0; border-bottom: 1px dashed rgba(124, 124, 124, 0.45); padding: 8px 0; }
+    .constraints li { grid-template-columns: 1fr; }
+    .constraints .field { font-weight: 700; }
+  }
 </style>
 </head>
 <body>
 
-<header>
-  <h1>Live Telemanom</h1>
-  <span id="connStatus" class="pill">connecting…</span>
-  <span class="status" id="tickInfo">ticks: 0 · alerts: 0</span>
-</header>
+<main class="register" role="main">
 
-<main>
-  <section class="panel">
-    <h2>Telemetry — actual (blue) vs LSTM prediction (green)</h2>
-    <canvas id="signal"></canvas>
-  </section>
+  <!-- §0 — COVER / TITLE -->
+  <aside class="marker" aria-hidden="true">
+    §0
+    <span class="label">cover</span>
+  </aside>
+  <section class="hero">
+    <h1>telos</h1>
+    <p class="lede">
+      A single multi-agent pipeline that takes you from a raw telemetry
+      tick to a verified, auditable runbook — with a human-in-the-loop
+      safety model at every irreversible step. The agents are specialised,
+      the orchestration is deterministic, and the LLM (when added in
+      Phase 4) is a narrator — never an authority.
+    </p>
 
-  <section class="panel">
-    <h2>EWMA prediction error (orange) · anomalies (red dots)</h2>
-    <canvas id="error"></canvas>
-  </section>
-
-  <section class="panel">
-    <h2>Trigger anomaly (your phone is the satellite)</h2>
-    <div class="controls">
-      <a class="spike" href="/inject?type=spike&magnitude=1">⚡ Spike</a>
-      <a href="/inject?type=shift&magnitude=1">↗ Level shift (+1.0)</a>
-      <a href="/inject?type=shift&magnitude=-1">↘ Level shift (−1.0)</a>
-      <a href="/inject?type=dropout&magnitude=1">⛔ Dropout</a>
+    <div class="meta" aria-label="project metadata">
+      <div class="row"><dl><dt>repo&nbsp;·&nbsp;</dt><dd>telos</dd><dt>&nbsp;&nbsp;branch&nbsp;·&nbsp;</dt><dd>feature/frontend_final</dd></dl></div>
+      <div class="row"><dl><dt>phase&nbsp;·&nbsp;</dt><dd>1 (Detect → Diagnose → Propose → Validate)</dd></dl></div>
+      <div class="row"><dl><dt>twin&nbsp;·&nbsp;</dt><dd>5 subsystems · 8 channels · 13 causes · 9 procedures</dd></dl></div>
+      <div class="row"><dl><dt>test gate&nbsp;·&nbsp;</dt><dd>116 tests green (70 contract + 46 twin)</dd></dl></div>
     </div>
-    <p style="font-size:12px;color:var(--muted);margin:10px 0 0 0;">Or hit the URLs directly from your phone: <code>http://&lt;laptop-ip&gt;:8000/inject?type=spike&amp;magnitude=1</code></p>
   </section>
 
-  <section class="panel">
-    <h2>Recent alerts</h2>
-    <div class="legend">
-      <span><span class="swatch" style="background:var(--actual)"></span>actual</span>
-      <span><span class="swatch" style="background:var(--pred)"></span>prediction</span>
-      <span><span class="swatch" style="background:var(--error)"></span>EWMA error</span>
-      <span><span class="swatch" style="background:var(--anomaly)"></span>anomaly</span>
+  <!-- §1 — WHAT IT IS -->
+  <aside class="marker" aria-hidden="true">
+    §1
+    <span class="label">problem</span>
+  </aside>
+  <section>
+    <h2>What telos is</h2>
+
+    <h3>The problem</h3>
+    <p>
+      Modern satellite and constellation operations are
+      telemetry-heavy but human-triage-heavy. Anomaly
+      <em>detection</em> is largely solved — LSTM-based
+      streaming detectors work well in production at NASA, ESA, and
+      most commercial operators. What is not solved is everything
+      <em>after</em> detection: diagnosing the cause across
+      interdependent subsystems, proposing a recovery procedure that
+      is known-safe and known-effective, validating it before
+      committing, approving it under the right human-in-the-loop
+      gate, executing it with per-step receipts, and verifying the
+      outcome with a tamper-evident runbook that survives the
+      7-year retention window regulators and insurers require.
+    </p>
+    <p>
+      Each of these is a separate tool, a separate team, a separate
+      context switch in the operator's day. As constellations scale
+      from 1 to 10 to 100 to 1000 satellites, the human-triage model
+      breaks.
+    </p>
+
+    <h3>The intended outcome</h3>
+    <p>
+      telos is a reference architecture for ops centers that want to
+      automate the post-detection pipeline. It is a runnable
+      prototype demonstrating Detect → Diagnose → Propose → Validate
+      against synthetic satellite telemetry, and a vehicle for
+      exploring how the trust, approval, and audit pieces fit
+      together before they get wired into a real ops center.
+    </p>
+
+    <h3>Scope — what it is, and is not</h3>
+    <p>
+      It is not a production-ready ops system. No real flight
+      hardware. No real regulatory certification. It is not an
+      LLM-agents framework — the LLM is a future narrator, not a
+      peer agent. It is not a physics-accurate simulator; the twin
+      is a deterministic state machine, enough to demonstrate the
+      validation contract, not enough to replace mission sims. It
+      is not a general anomaly-detection library; detection is
+      reused from the existing <code>live/</code> pipeline. telos
+      focuses on the stages after detection.
+    </p>
+
+    <div class="aside">
+      "telos is a single multi-agent pipeline that takes you from a
+      raw telemetry tick to a verified, auditable runbook with a
+      human-in-the-loop safety model at every irreversible step."
+      <span class="who">— BIBLE §1, the intended outcome</span>
     </div>
-    <div id="alertLog"></div>
   </section>
+
+  <!-- §2 — THE PIPELINE -->
+  <aside class="marker" aria-hidden="true">
+    §2
+    <span class="label">pipeline</span>
+  </aside>
+  <section>
+    <h2>The 7-stage pipeline</h2>
+
+    <!-- pipeline diagram: hand-drawn feel, teal strokes -->
+    <svg class="pipeline" viewBox="0 0 700 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="7-stage pipeline diagram: telemetry flows into Detect, Diagnose, Propose, Validate; the Phase 1 boundary separates the four implemented stages from the three deferred stages Approve, Execute, Verify.">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#2e5266"/>
+        </marker>
+      </defs>
+
+      <!-- left rail: telemetry source -->
+      <g font-family="JetBrains Mono, monospace" font-size="11" fill="#1a1a1a">
+        <rect x="10" y="135" width="86" height="50" fill="none" stroke="#2e5266" stroke-width="1.2"/>
+        <text x="53" y="155" text-anchor="middle" fill="#7c7c7c">source</text>
+        <text x="53" y="172" text-anchor="middle" fill="#1a1a1a">telemetry</text>
+      </g>
+
+      <!-- 7 stage boxes -->
+      <g font-family="Söhne, Inter, sans-serif" font-size="13" fill="#1a1a1a">
+        <!-- 1 DETECT -->
+        <rect x="120" y="20" width="100" height="50" fill="none" stroke="#2e5266" stroke-width="1.2"/>
+        <text x="170" y="42" text-anchor="middle" font-weight="700">1. DETECT</text>
+        <text x="170" y="60" text-anchor="middle" font-size="10" fill="#7c7c7c">LSTM + EWMA</text>
+
+        <!-- 2 DIAGNOSE -->
+        <rect x="120" y="90" width="100" height="50" fill="none" stroke="#2e5266" stroke-width="1.2"/>
+        <text x="170" y="112" text-anchor="middle" font-weight="700">2. DIAGNOSE</text>
+        <text x="170" y="130" text-anchor="middle" font-size="10" fill="#7c7c7c">cause registry</text>
+
+        <!-- 3 PROPOSE -->
+        <rect x="120" y="160" width="100" height="50" fill="none" stroke="#2e5266" stroke-width="1.2"/>
+        <text x="170" y="182" text-anchor="middle" font-weight="700">3. PROPOSE</text>
+        <text x="170" y="200" text-anchor="middle" font-size="10" fill="#7c7c7c">validate top-K</text>
+
+        <!-- 4 VALIDATE -->
+        <rect x="120" y="230" width="100" height="50" fill="none" stroke="#2e5266" stroke-width="1.2"/>
+        <text x="170" y="252" text-anchor="middle" font-weight="700">4. VALIDATE</text>
+        <text x="170" y="270" text-anchor="middle" font-size="10" fill="#7c7c7c">twin sim · verdict</text>
+
+        <!-- 5 APPROVE -->
+        <rect x="450" y="20" width="100" height="50" fill="none" stroke="#7c7c7c" stroke-width="1" stroke-dasharray="3 3"/>
+        <text x="500" y="42" text-anchor="middle" font-weight="700" fill="#7c7c7c">5. APPROVE</text>
+        <text x="500" y="60" text-anchor="middle" font-size="10" fill="#7c7c7c">deferred (P2)</text>
+
+        <!-- 6 EXECUTE -->
+        <rect x="450" y="90" width="100" height="50" fill="none" stroke="#7c7c7c" stroke-width="1" stroke-dasharray="3 3"/>
+        <text x="500" y="112" text-anchor="middle" font-weight="700" fill="#7c7c7c">6. EXECUTE</text>
+        <text x="500" y="130" text-anchor="middle" font-size="10" fill="#7c7c7c">deferred (P2)</text>
+
+        <!-- 7 VERIFY -->
+        <rect x="450" y="160" width="100" height="50" fill="none" stroke="#7c7c7c" stroke-width="1" stroke-dasharray="3 3"/>
+        <text x="500" y="182" text-anchor="middle" font-weight="700" fill="#7c7c7c">7. VERIFY</text>
+        <text x="500" y="200" text-anchor="middle" font-size="10" fill="#7c7c7c">deferred (P3)</text>
+
+        <!-- runbook artifact (terminal node) -->
+        <rect x="600" y="160" width="90" height="50" fill="none" stroke="#b8500d" stroke-width="1.2"/>
+        <text x="645" y="182" text-anchor="middle" font-weight="700" fill="#b8500d">RUNBOOK</text>
+        <text x="645" y="200" text-anchor="middle" font-size="10" fill="#7c7c7c">Merkle · P3</text>
+      </g>
+
+      <!-- arrows: source to stage 1 (fan out) -->
+      <g fill="none" stroke="#2e5266" stroke-width="1" marker-end="url(#arr)">
+        <path d="M 96 145 L 120 45"/>
+        <path d="M 96 155 L 120 115"/>
+        <path d="M 96 165 L 120 185"/>
+        <path d="M 96 175 L 120 255"/>
+      </g>
+
+      <!-- arrows: 1→2→3→4 vertical -->
+      <g fill="none" stroke="#2e5266" stroke-width="1" marker-end="url(#arr)">
+        <path d="M 170 70 L 170 90"/>
+        <path d="M 170 140 L 170 160"/>
+        <path d="M 170 210 L 170 230"/>
+      </g>
+
+      <!-- phase 1 boundary -->
+      <g stroke="#b8500d" stroke-width="1.2" stroke-dasharray="2 4">
+        <line x1="270" y1="10" x2="270" y2="290"/>
+      </g>
+      <g font-family="JetBrains Mono, monospace" font-size="10" fill="#b8500d">
+        <text x="275" y="20" transform="rotate(90 275 20)">Phase 1 boundary — structural, no code path crosses it in P1</text>
+      </g>
+
+      <!-- arrow from validate (4) over to approve (5) — the one seam -->
+      <g fill="none" stroke="#7c7c7c" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#arr)">
+        <path d="M 220 255 C 320 255, 380 45, 450 45"/>
+      </g>
+
+      <!-- arrows: 5→6→7→runbook -->
+      <g fill="none" stroke="#7c7c7c" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#arr)">
+        <path d="M 550 45 L 550 115"/>
+        <path d="M 550 115 L 550 185"/>
+        <path d="M 550 185 L 600 185"/>
+      </g>
+
+      <!-- LLM narrator note (top right) -->
+      <g font-family="JetBrains Mono, monospace" font-size="10" fill="#7c7c7c">
+        <text x="640" y="20" text-anchor="end">LLM = narrator, not authority. P4 seam.</text>
+      </g>
+    </svg>
+    <p class="pipeline-caption">
+      Fig. 1 — Stage 1–4 are shipping (solid teal). Stages 5–7 are
+      deferred to Phase 2/3 (dashed grey). The Phase 1 boundary is
+      structural: there is no code path that crosses it in Phase 1.
+    </p>
+
+    <h3>Stage 1 — Detect</h3>
+    <p>
+      Continuously scores live telemetry against an LSTM-predicted
+      baseline, smooths the prediction error with an EWMA filter,
+      runs the telemanom thresholding pipeline on the smoothed-error
+      window, and emits a per-channel deviation signal. Lives in
+      <code>live/</code>: FastAPI server, LSTM runner, streaming
+      error pipeline, synthetic generator, config. Five modules,
+      ~1,000 lines.
+    </p>
+
+    <h3>Stage 2 — Diagnose</h3>
+    <p>
+      Given a window of <code>SymptomEvent</code>s, scores every
+      cause in the registry against the window's evidence and
+      returns the ranked list. The score is a sum of three terms
+      (+1.0 per channel-overlap event, +0.5 per subsystem-overlap
+      event, +0.25 stickiness bonus per additional matching event);
+      the threshold is <code>MIN_DIAGNOSE_SCORE = 0.5</code>. The
+      rubric is independent of how the symptom events were
+      generated — Diagnose does not know if they came from a live
+      LSTM alert or a synthetic seeding. <code>twin/diagnose.py</code>,
+      152 lines.
+    </p>
+
+    <h3>Stage 3 — Propose</h3>
+    <p>
+      Given a cause and the current twin state, picks the best
+      procedure by twin-validated risk — <em>not</em> by catalog
+      rank or <code>default_procedure_id</code>. Two-stage
+      selection: pre-filter candidates to
+      <code>PROPOSE_TOP_K = 5</code> by catalog-level
+      <code>effort_score / mission_impact / reversibility</code>
+      (D-16), then validate all top-K in parallel in a
+      <code>ThreadPoolExecutor</code> (D-17). The twin is the
+      source of truth for "what will happen if I apply procedure X
+      to state S" — letting it do the ranking means Propose is
+      honest. Multi-axis lexicographic ranking (D-19) is the
+      final arbiter: <code>(mission_impact_score, effort_score,
+      reversibility_score, risk_score)</code>, ascending. The
+      <code>RankedCandidate</code> dataclass (D-18) carries the
+      catalog fields through so the runbook renders the same
+      logic the operator sees.
+    </p>
+
+    <h3>Stage 4 — Validate</h3>
+    <p>
+      Projects the twin forward from a starting state with a
+      proposed procedure applied — twice. Once with the procedure,
+      once without. The two-trajectory model gives the operator
+      the <em>delta</em>: predicted vs baseline arrays keyed by
+      state field, 31 points each over the default 1-hour
+      horizon. Six constraints are checked per timestep
+      (battery_soc, battery_voltage_v, battery_temp_c,
+      electronics_temp_c, payload_temp_c, pointing_error_deg).
+      The verdict wrapper maps the result to
+      <code>OK | REJECT | INCONCLUSIVE</code> with
+      <code>RISK_THRESHOLD_INCONCLUSIVE = 0.3</code>.
+    </p>
+
+    <h3>Stages 5–7 — deferred</h3>
+    <p>
+      Stage 5 (Approve) is Phase 2: the policy-gated operator
+      approval with the 4-class risk scheme and the LLM locked
+      out of the gate by structure, not by prompt. Stage 6
+      (Execute) is Phase 2: a <code>CommandBus</code> walking the
+      approved procedure with per-step input/output hashes and
+      operator signatures. Stage 7 (Verify) is Phase 3: a
+      Merkle-chained runbook, content-addressed evidence
+      (<code>evidence://&lt;sha256&gt;</code>), and a replay
+      harness that survives the 7-year retention window.
+    </p>
+  </section>
+
+  <!-- §3 — THE TWIN -->
+  <aside class="marker" aria-hidden="true">
+    §3
+    <span class="label">twin</span>
+  </aside>
+  <section>
+    <h2>The digital twin</h2>
+
+    <p>
+      A lumped, deterministic state machine implementing 5
+      subsystems across 8 channels, ~3,012 lines in
+      <code>digital-twin/twin/</code>. Same starting state + same
+      procedure + same params → byte-identical
+      <code>ValidationResult</code>. This is the invariant that
+      makes the Phase 3 Merkle chain work.
+    </p>
+
+    <div class="data" aria-label="twin size statistics">
+      <div class="stat"><span class="v">5</span><span class="k">subsystems</span></div>
+      <div class="stat"><span class="v">8</span><span class="k">channels</span></div>
+      <div class="stat"><span class="v">13</span><span class="k">causes</span></div>
+      <div class="stat"><span class="v">9</span><span class="k">procedures</span></div>
+    </div>
+
+    <h3>Subsystem / channel map</h3>
+    <table class="subsystems" aria-label="subsystem channel map">
+      <thead>
+        <tr>
+          <th>Subsystem</th>
+          <th>Channels</th>
+          <th>State fields</th>
+          <th>Green / amber / red</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>EPS</td>
+          <td class="mono">P-1 · P-2</td>
+          <td class="mono">battery_soc · battery_voltage_v</td>
+          <td>SoC ≥0.5 / 0.2–0.5 / &lt;0.2 · V 26–30 / 24–26 or 30–32 / &lt;24 or &gt;32</td>
+        </tr>
+        <tr>
+          <td>Battery</td>
+          <td class="mono">B-1</td>
+          <td class="mono">battery_temp_c</td>
+          <td>0–40°C / –10–0 or 40–55 / &lt;–10 or &gt;55</td>
+        </tr>
+        <tr>
+          <td>Thermal</td>
+          <td class="mono">T-1 · T-2</td>
+          <td class="mono">payload_temp_c · electronics_temp_c</td>
+          <td>per channel nominal; amber at edges, red at violation</td>
+        </tr>
+        <tr>
+          <td>ADCS</td>
+          <td class="mono">A-1 · G-1</td>
+          <td class="mono">pointing_error_deg</td>
+          <td>&lt;1° / 1–5° / &gt;5°</td>
+        </tr>
+        <tr>
+          <td>Comms</td>
+          <td class="mono">D-1</td>
+          <td class="mono">link_margin_db</td>
+          <td>&gt;6 dB / 3–6 dB / &lt;3 dB</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>Constraint check (per-timestep, Validate)</h4>
+    <ul class="constraints">
+      <li><span class="field">battery_soc</span><span class="range">[0.10, 1.00]</span><span class="note">never below 10%</span></li>
+      <li><span class="field">battery_voltage_v</span><span class="range">[24.0, 32.0]</span><span class="note">24V is LVC for 28V bus</span></li>
+      <li><span class="field">battery_temp_c</span><span class="range">[–20.0, 60.0]</span><span class="note">Li-ion survival</span></li>
+      <li><span class="field">electronics_temp_c</span><span class="range">[–20.0, 70.0]</span><span class="note"></span></li>
+      <li><span class="field">payload_temp_c</span><span class="range">[–20.0, 60.0]</span><span class="note"></span></li>
+      <li><span class="field">pointing_error_deg</span><span class="range">[0.0, 10.0]</span><span class="note">use abs value; 10° is unacceptable</span></li>
+    </ul>
+
+    <h3>Cause catalog (13)</h3>
+    <div class="catalog" aria-label="cause catalog">
+      <div class="item"><span class="id">eps_internal_r_ramp</span><span class="name">EPS internal resistance ramp</span></div>
+      <div class="item"><span class="id">eps_load_step</span><span class="name">EPS load step</span></div>
+      <div class="item"><span class="id">battery_overdischarge</span><span class="name">Battery overdischarge</span></div>
+      <div class="item"><span class="id">battery_undervoltage</span><span class="name">Battery undervoltage</span></div>
+      <div class="item"><span class="id">thermal_heater_stuck_off</span><span class="name">Thermal heater stuck off</span></div>
+      <div class="item"><span class="id">thermal_heater_stuck_on</span><span class="name">Thermal heater stuck on</span></div>
+      <div class="item"><span class="id">thermal_runaway</span><span class="name">Thermal runaway</span></div>
+      <div class="item"><span class="id">adcs_star_tracker_lost</span><span class="name">ADCS star-tracker lost</span></div>
+      <div class="item"><span class="id">wheel_saturation</span><span class="name">Reaction-wheel saturation</span></div>
+      <div class="item"><span class="id">solar_degradation</span><span class="name">Solar panel degradation</span></div>
+      <div class="item"><span class="id">comm_ground_station_lost</span><span class="name">Comms ground station lost</span></div>
+      <div class="item"><span class="id">sensor_noise</span><span class="name">Sensor noise (meta-cause)</span></div>
+      <div class="item"><span class="id">no_fault_detected</span><span class="name">No fault detected (sentinel)</span></div>
+    </div>
+
+    <h3>Procedure catalog (9)</h3>
+    <ol class="procedures" aria-label="procedure catalog">
+      <li><span class="id">P1</span><span class="name">eps_shed_non_essential_load</span></li>
+      <li><span class="id">P2</span><span class="name">eps_increase_charging_priority</span></li>
+      <li><span class="id">P3</span><span class="name">thermal_enable_heater_backup</span></li>
+      <li><span class="id">P4</span><span class="name">thermal_throttle_payload</span></li>
+      <li><span class="id">P5</span><span class="name">adcs_switch_to_safe_hold</span></li>
+      <li><span class="id">P6</span><span class="name">adcs_reset_star_tracker</span></li>
+      <li><span class="id">P7</span><span class="name">comms_postpone_downlink</span></li>
+      <li><span class="id">P8</span><span class="name">mode_change_to_safe</span></li>
+      <li><span class="id">P9</span><span class="name">wait</span></li>
+    </ol>
+
+    <h3>Why the catalog is one file (D-10)</h3>
+    <p>
+      The cause enum, the procedure enum, the parameter schemas
+      (with bounds), the precondition/postcondition predicates,
+      the approval requirement per procedure, and the twin's
+      <code>apply_procedure()</code> function are all defined in
+      a single Python module. The catalog cannot lie about what
+      the twin can do, because both come from the same file. The
+      cost is that editing the catalog is editing code (it goes
+      through the same review as code); the benefit is that
+      drift is structurally impossible.
+    </p>
+  </section>
+
+  <!-- §4 — THE BRIDGE -->
+  <aside class="marker" aria-hidden="true">
+    §4
+    <span class="label">bridge</span>
+  </aside>
+  <section>
+    <h2>The bridge — the single seam</h2>
+
+    <p>
+      <code>live/twin_bridge.py</code> (~470 lines) is the only
+      module in <code>live/</code> that imports from
+      <code>twin/</code>. It exposes two public functions
+      (<code>inject_fault</code> and
+      <code>run_phase1_pipeline</code>) and two public tables
+      (<code>INJECTION_TO_FAULT</code> with 13 entries,
+      <code>CHANNEL_TO_SUBSYSTEM</code> with 8 entries).
+    </p>
+
+    <p>
+      The lazy-import pattern (<code>_ensure_twin_on_path()</code>
+      at the top of every twin-using function) keeps
+      <code>live/ws_server.py</code> bootable on system Python
+      without the CHESS astropy chain. If the CHESS venv is
+      missing, <code>run_phase1_pipeline()</code> returns
+      <code>None</code>; the live server keeps running;
+      <code>/inject_twin_fault</code> returns 503. This is the
+      right behavior: tell the operator the feature is
+      unavailable, don't crash.
+    </p>
+
+    <div class="aside">
+      "Putting all the cross-boundary knowledge in one file makes
+      it auditable, testable in isolation, and replaceable — to
+      a gRPC twin in Phase 2 — without touching the rest of
+      live/."
+      <span class="who">— D-14, the bridge is the only place live/ imports from twin/</span>
+    </div>
+  </section>
+
+  <!-- §5 — TRUST & APPROVAL -->
+  <aside class="marker" aria-hidden="true">
+    §5
+    <span class="label">trust</span>
+  </aside>
+  <section>
+    <h2>Trust, approval, and the LLM boundary</h2>
+
+    <p>
+      The system has a structural answer to the question "where
+      does the human stand in front of the machine?" The answer
+      is: the human is the only thing the machine cannot bypass.
+      The LLM has no path to the approval gate. This is enforced
+      structurally — the LLM's tool surface does not include the
+      gate — not by prompt. The four-class risk scheme (A/B/C/D)
+      is the policy layer; the 30-second hold-down timer and the
+      2-person rule for Class D are the procedural layer; the
+      dry-run preview UI is the operator's view.
+    </p>
+
+    <h3>What the LLM is and is not</h3>
+    <p>
+      In Phase 1, the LLM is <em>nothing</em>. There is no
+      narrator protocol, no LLM SDK in requirements, no API keys
+      in the repo. The structured outputs (Diagnosis, Proposal,
+      Verdict) carry only structured data; prose is added in
+      Phase 4 as a post-processor.
+    </p>
+    <p>
+      In Phase 4, the LLM will write prose around the
+      already-structured outputs. The narrator cannot change the
+      cause Diagnose picked, cannot change the procedure Propose
+      picked, cannot issue an ApprovalToken. Every claim in the
+      narrative must map to a catalog entry or an evidence ref.
+      The narrator is a pure function of its inputs in tests.
+    </p>
+
+    <div class="aside">
+      "The LLM has no path to the approval gate. This is
+      enforced structurally, not by prompt."
+      <span class="who">— BIBLE §7, the human-in-the-loop model</span>
+    </div>
+  </section>
+
+  <!-- §6 — THE RUNBOOK -->
+  <aside class="marker" aria-hidden="true">
+    §6
+    <span class="label">runbook</span>
+  </aside>
+  <section>
+    <h2>The runbook</h2>
+
+    <p>
+      The runbook is the operator-facing artifact the dashboard
+      renders after an injection. It is built once at inject
+      time (per the BIBLE §2 predictive-pipeline contract) and
+      persists across page refreshes via the in-memory
+      <code>RunbookStore</code> (a thread-safe FIFO capped at
+      50 entries, ids of the form <code>RB-YYYYMMDD-NNNN</code>).
+    </p>
+
+    <h3>9 sections, in order</h3>
+    <ol class="toc" aria-label="runbook sections">
+      <li><span class="num">1</span><span class="title">Verdict status badge</span><span class="pg">OK · REJECT · INCONCLUSIVE</span></li>
+      <li><span class="num">2</span><span class="title">Verdict reason</span><span class="pg">one-line rollup</span></li>
+      <li><span class="num">3</span><span class="title">Diagnosis</span><span class="pg">cause · score · affected subsystems · expected channels · pipeline timestamps</span></li>
+      <li><span class="num">4</span><span class="title">Procedure</span><span class="pg">winner · parameters · risk gauge · risk class · approval</span></li>
+      <li><span class="num">5</span><span class="title">Twin prediction</span><span class="pg">3-field trajectory canvas (SoC, T_bat, T_pay) · predicted vs baseline</span></li>
+      <li><span class="num">6</span><span class="title">Why this procedure</span><span class="pg">multi-axis ranking · winner-factors · considered vs simulated</span></li>
+      <li><span class="num">7</span><span class="title">Evidence</span><span class="pg">symptom window · constraint violations</span></li>
+      <li><span class="num">8</span><span class="title">Approval</span><span class="pg">Approve · Reject (Phase 2 stub)</span></li>
+      <li><span class="num">9</span><span class="title">Footer metadata</span><span class="pg">fault_id · generated_at · runbook_id · twin digest</span></li>
+    </ol>
+
+    <h3>Endpoints</h3>
+    <ul class="constraints">
+      <li><span class="field">GET&nbsp;/api/runbooks?limit=N</span><span class="range">list</span><span class="note">most-recent-first summary view</span></li>
+      <li><span class="field">GET&nbsp;/api/runbooks/{id}</span><span class="range">detail</span><span class="note">all 9 sections + trajectory arrays + approval block</span></li>
+      <li><span class="field">GET&nbsp;/api/runbooks/{id}/trajectory</span><span class="range">light</span><span class="note">just the 3-field trajectory for chart polling</span></li>
+    </ul>
+  </section>
+
+  <!-- §7 — TABLE OF CONTENTS -->
+  <aside class="marker" aria-hidden="true">
+    §7
+    <span class="label">index</span>
+  </aside>
+  <section>
+    <h2>How to read this project</h2>
+
+    <p>
+      The BIBLE is the source of truth for "what is telos and
+      why." Code may drift; the BIBLE must not. If you change
+      the architecture, update the BIBLE in the same commit.
+      The sections below are the project's table of contents.
+    </p>
+
+    <ol class="toc" aria-label="table of contents">
+      <li><span class="num">§1</span><span class="title">What telos is — the problem and the intended outcome</span><span class="pg">page 1</span></li>
+      <li><span class="num">§2</span><span class="title">The 7-stage pipeline — Detect, Diagnose, Propose, Validate, Approve, Execute, Verify</span><span class="pg">page 3</span></li>
+      <li><span class="num">§3</span><span class="title">Current implementation state — what landed, what we're building, what is left</span><span class="pg">page 9</span></li>
+      <li><span class="num">§4</span><span class="title">Decisions (D-1 through D-19) and the alternatives rejected</span><span class="pg">page 24</span></li>
+      <li><span class="num">§5</span><span class="title">The hand-authored knowledge catalogs — causes, procedures, the cause→procedure map</span><span class="pg">page 41</span></li>
+      <li><span class="num">§6</span><span class="title">The digital twin — 5 subsystems, 8 channels, the two-trajectory model</span><span class="pg">page 47</span></li>
+      <li><span class="num">§7</span><span class="title">Trust and approval — the 4-class risk scheme, the LLM boundary</span><span class="pg">page 52</span></li>
+      <li><span class="num">§8</span><span class="title">Audit and runbooks — the Merkle-chained evidence, the 7-year retention</span><span class="pg">page 55</span></li>
+      <li><span class="num">§9</span><span class="title">The human-in-the-loop model — the dry-run preview, the 2-person rule</span><span class="pg">page 58</span></li>
+      <li><span class="num">§10</span><span class="title">Future branches — Phase 2 (Approve/Execute), Phase 3 (Verify), Phase 4 (narrator)</span><span class="pg">page 60</span></li>
+      <li><span class="num">§11</span><span class="title">Repo conventions — branches, commits, worktrees, the BIBLE rule</span><span class="pg">page 62</span></li>
+      <li><span class="num">§12</span><span class="title">Tooling and dependencies — the CHESS venv, the keras stub, the test gate</span><span class="pg">page 64</span></li>
+    </ol>
+  </section>
+
+  <!-- COLOPHON -->
+  <aside class="marker" aria-hidden="true">
+    <span class="label">colophon</span>
+  </aside>
+  <section>
+    <div class="colophon">
+      <div class="row"><span class="k">project</span>telos — multi-agent pipeline for satellite anomaly operations</div>
+      <div class="row"><span class="k">branch</span>feature/frontend_final</div>
+      <div class="row"><span class="k">phase</span>1 of 4 — Detect → Diagnose → Propose → Validate shipping; 5–7 deferred</div>
+      <div class="row"><span class="k">tests</span>116 green (70 contract + 46 twin)</div>
+      <div class="row"><span class="k">twin</span>~3,012 LOC across digital-twin/twin/</div>
+      <div class="row"><span class="k">catalog</span>13 causes × 9 procedures × ~21 edges (D-3, D-11)</div>
+      <div class="row"><span class="k">determinism</span>byte-identical ValidationResult for same (state, procedure, params)</div>
+      <div class="row"><span class="k">no-LLM</span>Phase 1 has no LLM SDK, no narrator protocol, no API keys in repo</div>
+      <div class="row"><span class="k">source</span>BIBLE.md, D-1 through D-19, digital-twin/twin/, live/, test/</div>
+    </div>
+  </section>
+
 </main>
 
-<footer>
-  Telemanom (Hundman et al., 2018) · 2x LSTM(80) + dynamic thresholding · live demo
-</footer>
-
-<script>
-"use strict";
-
-const MAX_POINTS = 800;
-const actualBuf = [];    // {t, v}
-const predBuf = [];      // {t, v}
-const errorBuf = [];     // {t, v}
-const anomalies = [];    // {t, v, score}
-
-let totalTicks = 0;
-let totalAlerts = 0;
-let alertLogEl, connEl, tickEl;
-
-function pushBufs(buf, pt, max) {
-  buf.push(pt);
-  if (buf.length > max) buf.shift();
-}
-
-function connect() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const url = `${proto}://${location.host}/stream`;
-  const ws = new WebSocket(url);
-  ws.onopen = () => {
-    connEl.textContent = "live";
-    connEl.classList.add("live");
-  };
-  ws.onclose = () => {
-    connEl.textContent = "disconnected — retrying…";
-    connEl.classList.remove("live");
-    setTimeout(connect, 1000);
-  };
-  ws.onerror = () => ws.close();
-  ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
-    totalTicks = Math.max(totalTicks, m.t);
-    pushBufs(actualBuf, {t: m.t, v: m.value}, MAX_POINTS);
-    pushBufs(predBuf, {t: m.t, v: m.pred}, MAX_POINTS);
-    pushBufs(errorBuf, {t: m.t, v: m.error}, MAX_POINTS);
-    if (m.anomaly) {
-      totalAlerts++;
-      const mid = Math.floor((m.anomaly.seq[0] + m.anomaly.seq[1]) / 2);
-      anomalies.push({t: mid, v: m.error, score: m.anomaly.score});
-      if (anomalies.length > 100) anomalies.shift();
-      const row = document.createElement("div");
-      row.className = "row";
-      row.innerHTML = `<span class="t">t=${m.t}</span> · score=${m.anomaly.score.toFixed(2)} · seq=[${m.anomaly.seq[0]}, ${m.anomaly.seq[1]}]`;
-      alertLogEl.insertBefore(row, alertLogEl.firstChild);
-      while (alertLogEl.children.length > 50) alertLogEl.removeChild(alertLogEl.lastChild);
-    }
-    tickEl.textContent = `ticks: ${totalTicks} · alerts: ${totalAlerts}`;
-    draw();
-  };
-}
-
-// -- canvas helpers ------------------------------------------------------
-
-function setupCanvas(cv) {
-  const dpr = window.devicePixelRatio || 1;
-  const rect = cv.getBoundingClientRect();
-  cv.width = rect.width * dpr;
-  cv.height = rect.height * dpr;
-  const ctx = cv.getContext("2d");
-  ctx.scale(dpr, dpr);
-  return {ctx, w: rect.width, h: rect.height};
-}
-
-function drawSeries(ctx, w, h, series, color, fill = false) {
-  if (series.length < 2) return;
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.4;
-  ctx.beginPath();
-  for (let i = 0; i < series.length; i++) {
-    const x = (i / (MAX_POINTS - 1)) * w;
-    const y = h - (series[i].v * 0.4 + 0.5) * h;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-}
-
-function drawError(ctx, w, h, series, color) {
-  if (series.length < 2) return;
-  const maxV = Math.max(0.05, ...series.map(p => p.v));
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.2;
-  ctx.beginPath();
-  for (let i = 0; i < series.length; i++) {
-    const x = (i / (MAX_POINTS - 1)) * w;
-    const y = h - Math.min(1, series[i].v / maxV) * h;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-}
-
-function drawAnomalies(ctx, w, h, series, maxV) {
-  ctx.fillStyle = "#f85149";
-  for (const a of series) {
-    // map anomaly tick to x position based on t-window
-    const lastT = actualBuf.length ? actualBuf[actualBuf.length-1].t : 0;
-    const x = ((a.t - (lastT - MAX_POINTS + 1)) / (MAX_POINTS - 1)) * w;
-    if (x < 0 || x > w) continue;
-    const y = h - Math.min(1, a.v / maxV) * h;
-    ctx.beginPath();
-    ctx.arc(x, y, 4, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
-
-function draw() {
-  // signal
-  {
-    const cv = document.getElementById("signal");
-    const {ctx, w, h} = setupCanvas(cv);
-    ctx.clearRect(0, 0, w, h);
-    ctx.strokeStyle = "#30363d";
-    ctx.beginPath(); ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke();
-    drawSeries(ctx, w, h, actualBuf, "#58a6ff");
-    drawSeries(ctx, w, h, predBuf, "#3fb950");
-  }
-  // error + anomalies
-  {
-    const cv = document.getElementById("error");
-    const {ctx, w, h} = setupCanvas(cv);
-    ctx.clearRect(0, 0, w, h);
-    const maxV = Math.max(0.05, ...errorBuf.map(p => p.v));
-    drawError(ctx, w, h, errorBuf, "#d29922");
-    drawAnomalies(ctx, w, h, anomalies, maxV);
-  }
-}
-
-window.addEventListener("resize", draw);
-
-document.addEventListener("DOMContentLoaded", () => {
-  alertLogEl = document.getElementById("alertLog");
-  connEl = document.getElementById("connStatus");
-  tickEl = document.getElementById("tickInfo");
-  connect();
-});
-</script>
 </body>
 </html>
