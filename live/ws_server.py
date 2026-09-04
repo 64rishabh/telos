@@ -101,6 +101,14 @@ class AppState:
         """Initialize the in-process twin FaultScheduler. Called from
         create_app() so the live server boots even when the CHESS venv
         is unavailable — in that case inject_twin_fault returns 503."""
+        # The `twin` package lives at <repo>/digital-twin/, which is not
+        # on sys.path by default when this module is run as
+        # `python -m uvicorn live.ws_server:app`. Bridge code calls
+        # `_ensure_twin_on_path()` at use time; we do the same here so
+        # the FaultScheduler import resolves whether the server is
+        # booted from the repo root (system python) or the CHESS venv.
+        from .twin_bridge import _ensure_twin_on_path
+        _ensure_twin_on_path()
         try:
             from twin.fault_injection import FaultScheduler
         except Exception as e:
