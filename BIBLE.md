@@ -21,6 +21,7 @@
    - [D-16. Catalog-level editorial fields](#d-16-catalog-level-editorial-fields-effort_score-mission_impact-reversibility)
    - [D-17. Propose runs top-K simulations in parallel](#d-17-propose-runs-top-k-simulations-in-parallel-and-streams-progress-to-the-frontend)
    - [D-18. RankedCandidate replaces the candidates_ranked tuple](#d-18-rankedcandidate-replaces-the-candidates_ranked-tuple)
+   - [D-19. Propose ranks by multi-axis lexicographic key](#d-19-propose-ranks-by-multi-axis-lexicographic-key-not-by-risk_score)
 5. [The hand-authored knowledge catalogs](#5-the-hand-authored-knowledge-catalogs)
 6. [The digital twin](#6-the-digital-twin)
 7. [Trust and approval](#7-trust-and-approval)
@@ -768,22 +769,42 @@ the stickiness math.
 Propose is the **validation-based ranking** layer (D-12). It
 calls `validate_procedure()` for every candidate procedure
 returned by `get_candidate_procedures(cause)`, ranks them by
-`risk_score`, and returns the lowest-risk candidate as the
-winning `Proposal`.
+**multi-axis lexicographic key** (D-19), and returns the
+lowest-key candidate as the winning `Proposal`.
+
+**Multi-axis ranking (D-19).** The winner is the row with the
+lowest tuple on `(mission_impact_score, effort_score,
+reversibility_score, risk_score)`, ascending. Risk is the
+final tie-breaker, not the primary axis: when two procedures
+are tied on mission_impact / effort / reversibility, the
+lower `risk_score` wins; otherwise the catalog fields decide
+and the runtime risk_score is never consulted. The reasoning
+is D-12's "future evolution" — the catalog fields the operator
+sees in the runbook are the *same logic* that picked the
+winner, not just descriptive labels. The pre-filter
+(`_coarse_rank_key`, also lexicographic on the catalog fields
+but without runtime `risk_score`) keeps the candidate set to
+`PROPOSE_TOP_K = 5` before the expensive twin sims run.
 
 The `Proposal` dataclass (`cause`, `cause_score`, `procedure`,
 `procedure_params`, `risk_score`, `validation`, `verdict`,
-`candidates_ranked`) carries enough for the operator's view
-and the Phase 3 runbook. The `to_dict()` method produces the
-JSON-serializable form the WebSocket broadcast carries.
+`candidates_ranked`, **`winner_rank_key`** — the
+4-tuple that picked the winner) carries enough for the
+operator's view, the runbook, and Phase 3. The `to_dict()`
+method produces the JSON-serializable form the WebSocket
+broadcast carries, including `winner_rank_key` as a list of
+floats.
 
 **Test surface:** `digital-twin/twin/tests/test_propose.py`
-(15 tests; covering the ranking math, the top-K pre-filter,
+(19 tests; covering the ranking math, the top-K pre-filter,
 the `RankedCandidate` shape, the default-params fall-back,
 the empty-candidate edge case, the `progress_cb` callback
-contract, and the structural executor test that asserts the
+contract, the structural executor test that asserts the
 top-K candidates run in a `ThreadPoolExecutor` with the
-correct `max_workers`) and
+correct `max_workers`, plus 4 multi-axis tests that pin the
+D-19 lexicographic key, the `winner_rank_key` propagation,
+the risk-score tie-breaker behavior, and the `to_dict()`
+ordering) and
 `test_procedures_defaults.py` (12 tests; covering the
 `PROCEDURE_REGISTRY.default_params`, the
 `get_default_params(procedure)` accessor, and the
@@ -858,7 +879,7 @@ randomness in the system is in the live `generator.py`
 
 #### The bridge (`live/twin_bridge.py`)
 
-`live/twin_bridge.py` (348 lines) is the **single seam** between
+`live/twin_bridge.py` (~470 lines) is the **single seam** between
 `live/` and `twin/` (D-14). It exposes two public functions
 (`inject_fault()` and `run_phase1_pipeline()`) and two public
 tables (`INJECTION_TO_FAULT` with 13 entries,
@@ -869,6 +890,99 @@ without the CHESS astropy chain. If the CHESS venv is missing,
 `run_phase1_pipeline()` returns `None`; the live server keeps
 running; `/inject_twin_fault` returns 503. See §2 Bridge for
 the full surface.
+
+**D-19 return shape.** `run_phase1_pipeline()` now returns
+`{"proposal": <dict>, "runbook": <dict or None>}`. The
+`proposal` block is the same JSON-serializable dict
+`proposal.to_dict()` produced before D-19 — the WS alert tick
+and the `/inject_twin_fault` response consume this directly.
+The `runbook` block is the new enriched view (see the
+"Runbook API (D-19)" section below). The bridge captures
+pipeline timestamps at each stage (`stage_1_detect`,
+`stage_2_diagnose`, `stage_3_propose`, `stage_4_validate`)
+and stamps them on the runbook's `pipeline` block so the
+operator can see when each stage ran. If the builder fails
+(e.g. numpy scope issue), the `runbook` block is `None` and
+the rest of the pipeline keeps working.
+
+#### Runbook API (D-19)
+
+The runbook is the operator-facing artifact the dashboard's
+`/runbook` route renders. It is built once at inject time
+(per the BIBLE §2 predictive-pipeline contract) and persists
+across page refreshes via the in-memory `RunbookStore`. The
+frontend (Milestone 2) wires its runbook page to the three
+endpoints below; the API surface is what landed in D-19.
+
+**`live/runbook_store.py` (~135 lines).** Thread-safe FIFO
+with id minting. Every `add(runbook)` returns a fresh
+`runbook_id` of the form `RB-YYYYMMDD-NNNN` (per-day counter
+resets at midnight UTC). The store caps at 50 entries
+(older ones evicted FIFO). Reads (`get(id)`,
+`list_recent(limit=20)`) are O(n) on the dict and take the
+same lock briefly. The cap is small because runbooks carry
+twin trajectory arrays (31 points × 3 fields × 2 series ≈
+2 KB each); Phase 2 moves the cap to the durable DB layer.
+
+**`live/runbook_builder.py` (~595 lines).** The enrichment
+layer. Given a `proposal_dict` + a `candidates_considered`
+list (every procedure the cause maps to, each with its
+`ProcedureSpec` attached under `_spec`) + the symptom
+window + the predicted/baseline trajectories from the
+winner's `ValidationResult`, builds the full runbook
+payload. Joins:
+- Cause catalog: `affected_subsystems()`, `expected_channels()`
+- Procedure catalog: `description`, `risk_class`,
+  `approval_required`, plus the editorial `effort_score` /
+  `mission_impact` / `reversibility` already on the
+  `RankedCandidate`
+- The multi-axis rank key on every candidate, the winner's
+  per-axis comparison list, and a human-readable "why this
+  won" reason
+- The 3 trajectory fields the runbook canvas renders:
+  `battery_soc`, `battery_temp_c`, `payload_temp_c`, each
+  with `baseline[]` and `predicted[]` arrays of length
+  `horizon_s / dt_s + 1` (31 points for the default
+  1h/120s horizon)
+- A `candidates_considered_detail` list that preserves
+  every procedure the cause mapped to, with `simulated:
+  true|false` and a `drop_reason` (`"coarse_rank above
+  top-K"`) for the ones the pre-filter dropped
+- Pipeline timestamps (`pipeline.stage_1..stage_4.at_unix`)
+  for the operator's "when this happened" view
+- An `approval` block (status `PENDING`, the required role
+  from the winner's `approval_required`); the operator's
+  Approve/Reject click fills this in (Phase 2)
+
+**`live/ws_server.py` additions.** The `AppState` holds a
+`RunbookStore` and a `latest_runbook_id` (the id of the most
+recent runbook minted). Three new endpoints:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/runbooks?limit=N` | List recent runbooks (most recent first); each entry is the **summary view** (id, fault_id, cause, subsystem, winner, verdict_status, generated_at) |
+| `GET` | `/api/runbooks/{runbook_id}` | Full payload (all 9 sections + trajectory arrays + approval block) |
+| `GET` | `/api/runbooks/{runbook_id}/trajectory` | Just the 3-field trajectory (lightweight for the chart components to poll) |
+
+`/inject_twin_fault` now mints a `runbook_id` and stamps it
+on the response (alongside the existing `fault_id` /
+`verdict`). The `latest_runbook_id` is also attached to
+**every WebSocket tick** so the dashboard can link to
+`/runbook` without polling. Unknown ids return 404.
+
+**Test surface:**
+- `test/test_71_runbook_store.py` (6 tests: id minting, cap,
+  thread safety, list limit, unknown-id 404, type validation)
+- `test/test_70_runbook_builder.py` (12 tests: cause catalog
+  fields, procedure catalog fields, candidates_considered
+  preservation, simulated-marking, winner-factors explanation,
+  trajectory shape, pipeline-timestamp monotonicity, verdict
+  passthrough, JSON-serializability, ranking-algorithm string,
+  single-candidate fallback, summary/trajectory views)
+- `test/test_72_runbook_endpoints.py` (8 tests: list-after-
+  inject, get-by-id, unknown-404, trajectory-endpoint shape,
+  WS carries runbook_id, ranking-algorithm in payload, list
+  limit, id format/uniqueness)
 
 #### Test gate
 
@@ -963,6 +1077,31 @@ the digital twin branch" section) is rewritten as a
 "Landed" changelog in the same commit. The pre-integration
 `glowing-painting-possum.md` plan files are kept for
 historical context (see the end of this section).
+
+**D-19 runbook API** (commit `87a4b0b`, branch
+`frontend/intitial_dashboard`) — the second post-merge
+landing. Adds multi-axis lexicographic ranking in
+`twin/propose.py`, the thread-safe `RunbookStore`, the
+`runbook_builder` enrichment layer, three new HTTP
+endpoints (`/api/runbooks`, `/api/runbooks/{id}`,
+`/api/runbooks/{id}/trajectory`), and a `runbook_id` field
+on every WebSocket tick. 30 new tests (4 multi-axis propose
++ 6 store + 12 builder + 8 endpoint). All 116 tests green
+(70 contract + 46 twin).
+
+**Live: ensure twin on sys.path before FaultScheduler
+import** (commit `ed33c34`) — the fix for the
+`No module named 'twin'` import error on
+`uvicorn live.ws_server:app` boot. Adds
+`_ensure_twin_on_path()` to `ws_server.init_twin()` so the
+CHESS venv isn't required for the live server to come up.
+
+The frontend (Vite + React + R3F) work has not yet started;
+`live/static/app/` is the placeholder shell from the
+pre-frontend era. The 3-route SPA, 3D satellite, subsystem
+cards, and runbook page wire to the data shapes documented
+in §3.2 below; the API surface D-19 added is what they'll
+consume.
 
 ### 3.2 — What we're building now
 
@@ -1076,12 +1215,16 @@ checks, final review.
 |---|---|---|---|---|
 | `GET` | `/` | On page load | — | Vite shell (HTML) |
 | `WS` | `ws://<host>/stream` | On first `/dashboard` mount | — | Stream of JSON messages at 5 Hz |
-| `POST` | `/inject_twin_fault` | When operator clicks "Inject" in the inject modal | `{kind, channel, magnitude}` (JSON) | `{status, fault_type, ...}` — current behavior, unchanged |
+| `POST` | `/inject_twin_fault` | When operator clicks "Inject" in the inject modal | `{kind, channel, magnitude}` (JSON) | `{status, fault_type, verdict, runbook_id, ...}` — see D-19 below |
+| `GET` | `/api/runbooks?limit=N` | When the runbook list page mounts (or after a new runbook is generated) | — | `Array<RunbookSummary>` (most recent first) |
+| `GET` | `/api/runbooks/{runbook_id}` | When the runbook detail page mounts (`/runbook?rb=...`) | — | Full `Runbook` payload (all 9 sections + trajectory arrays) |
+| `GET` | `/api/runbooks/{runbook_id}/trajectory` | When the trajectory canvas needs to refresh (polled less often than WS) | — | `{t_s[], battery_soc: {baseline[], predicted[]}, battery_temp_c: {...}, payload_temp_c: {...}, horizon_s, dt_s}` |
 | `GET` | `/` (Vite SPA fallback) | On any client-side route (`/dashboard`, `/runbook`) | — | Same Vite shell; React Router handles the route |
 
-No other endpoints. The frontend does **not** call
-Diagnose / Propose / Validate directly — it only reads
-`twin_verdict` from the WebSocket broadcast.
+The runbook API is what the operator's `/runbook` page
+calls to render the BIBLE §3.2 / §8 / §9 runbook. The
+endpoints were added in D-19; the shapes are documented
+under "The runbook page" below.
 
 #### WebSocket message shape (every tick at 5 Hz)
 
@@ -1101,6 +1244,7 @@ type TickMessage = {
   };
   twin_verdict: null | Proposal;  // null on most ticks; populated on the next tick after an inject that triggered a verdict
   sim_progress: null | SimProgressEvent;  // null on most ticks; populated while parallel twin sims are running (D-17)
+  runbook_id: null | string;  // D-19: null until a /inject_twin_fault has run; the id of the most recent runbook. The dashboard links /runbook?rb=<id> off this.
 };
 ```
 
@@ -1148,11 +1292,12 @@ TypeScript `Proposal` type matches this shape 1:1:
 type Proposal = {
   cause: Cause;                                 // enum from digital-twin/twin/procedures.py
   cause_score: number;                          // 0..5, threshold 0.5
-  procedure: Procedure;                         // enum (the winner = lowest risk_score)
+  procedure: Procedure;                         // enum — the winner under the multi-axis rank (D-19)
   procedure_params: Record<string, any>;        // the chosen procedure's params
-  risk_score: number;                           // 0..1, runtime risk from twin simulation
+  risk_score: number;                           // 0..1, runtime risk from twin simulation (also the gauge reading)
   verdict: Verdict;                             // OK | REJECT | INCONCLUSIVE
-  candidates_ranked: Array<RankedCandidate>;     // top-K, ordered by risk_score asc (D-16/D-18)
+  candidates_ranked: Array<RankedCandidate>;     // top-K, ordered by multi-axis _rank_key (D-19)
+  winner_rank_key: [number, number, number, number];  // [mission_impact_score, effort_score, reversibility_score, risk_score] of the winner
 };
 
 type RankedCandidate = {
@@ -1164,29 +1309,51 @@ type RankedCandidate = {
 };
 ```
 
+**Multi-axis ranking (D-19).** `candidates_ranked` is ordered
+by the lexicographic key `(mission_impact_score,
+effort_score, reversibility_score, risk_score)` ascending.
+The catalog fields are the primary decision axis; runtime
+risk_score is the final tie-breaker, only consulted when two
+candidates are tied on impact / effort / reversibility. This
+makes the catalog fields the operator sees in the runbook
+*the same logic that picked the winner*, not just
+descriptive labels. `winner_rank_key` is the 4-tuple that
+decided the comparison — the runbook builder uses it to
+compute the per-axis comparison list and the human-readable
+"why this won" reason (the deciding axis is the first
+position on which the two candidates differ).
+
 **The frontend's candidates table** (runbook section 6, "Why
 this procedure") renders one row per entry in
-`candidates_ranked`, sortable by `risk_score` (ascending — winner
-is on top) or by `effort_score` (cheap procedures bubble up).
-The winning row is highlighted; non-winning rows show their
-catalog fields so the operator can see "yes, mode_change_to_safe
-would have a lower risk_score, but its mission_impact is
-`mission-ending` and effort_score is 0.85 — that's why we picked
-the other one." This is the demo surface the catalog-level
-editorial fields (D-16) are designed to support.
+`candidates_ranked`, sorted by the multi-axis key (winner on
+top). The winning row is highlighted and its `factors` block
+includes a `rank_key_comparison[]` list (4 entries, one per
+axis) with `deciding: true` on the axis that picked the
+winner. Non-winning rows show their catalog fields plus a
+`factors.rejected_because` text that names the deciding
+axis ("lexicographic rank: mission_impact major (0.5) >
+winner none (0.0); deciding on mission_impact; risk_score
+not consulted"). This is the demo surface the catalog-level
+editorial fields (D-16) and the multi-axis ranking (D-19)
+are designed to support.
 
 **Note on the shape delta from earlier BIBLE drafts.** The
 `Proposal` shape shown here is the *current* landed contract
-(D-16, D-17, D-18). Earlier BIBLE drafts included extra
-runbook-enrichment fields at the top level —
+(D-16, D-17, D-18, **D-19**). The runbook-enrichment fields
+that earlier drafts listed at the top level —
 `affected_subsystems`, `expected_channels`, `risk_class`,
 `approval_required`, `procedure_description`, `symptom_window`,
-`twin_state_endpoints`, and a `trajectory` block with the 3-field
-canvas data. None of those have landed in code yet. They are
-expected to land in a follow-up frontend-milestone commit that
-extends `Proposal.to_dict()` to include them. When that commit
-lands, the BIBLE §3.2 TypeScript type above is updated in the
-same commit.
+`twin_state_endpoints`, the `trajectory` block with the
+3-field canvas data, the `candidates_considered_detail` block,
+the `pipeline` block with per-stage timestamps, the
+`approval` block, and the `winner_rank_key` field — have
+**all landed in D-19** as part of the runbook builder
+output (see "Runbook API (D-19)" in §3.1 and "The runbook
+page" below). The frontend's `/runbook` page reads them
+from `GET /api/runbooks/{runbook_id}`; the `Proposal` type
+above is what the WS `twin_verdict` field carries (a
+strict subset, sufficient for the dashboard's verdict
+panel).
 
 `Verdict`:
 
@@ -1351,55 +1518,91 @@ anomaly badge.
 
 #### The runbook page (Milestone 2 — full BIBLE §2 / §8 / §9 contract)
 
-Route: `/runbook`. Reads `verdictStore.latest`. Renders
-9 sections in order:
+Route: `/runbook?rb=<runbook_id>`. Reads the runbook
+from `GET /api/runbooks/{runbook_id}` (full payload) and
+optionally `GET /api/runbooks/{runbook_id}/trajectory` for
+the canvas (when the lightweight poll path is preferred).
+The store keeps the most recent 50 runbooks in memory;
+older ones are evicted. Renders 9 sections in order, with
+the data paths called out explicitly so the implementing
+agent knows which field maps to which endpoint field:
 
 1. **Verdict status badge** — `OK` (green) / `REJECT`
-   (red) / `INCONCLUSIVE` (amber), from `verdict.status`.
-2. **Verdict reason** — one-line from `verdict.reason`.
-3. **Diagnosis** — cause (humanized), cause score bar
-   (0–5 with the 0.5 `MIN_DIAGNOSE_SCORE` marker),
-   affected subsystems chips (from
-   `proposal.affected_subsystems`), expected channels
-   chips (from `proposal.expected_channels`).
-4. **Procedure** — procedure (humanized), description
-   (from `proposal.procedure_description`), parameters
-   table (key-value with units, from
-   `proposal.procedure_params`), risk score gauge
-   (0–1 with the 0.3 `RISK_THRESHOLD_INCONCLUSIVE`
-   marker), risk class pill (color-coded by
-   `proposal.risk_class`), approval required pill
-   (color-coded by `proposal.approval_required`).
+   (red) / `INCONCLUSIVE` (amber), from `runbook.verdict.status`.
+2. **Verdict reason** — one-line from `runbook.verdict.reason`.
+3. **Diagnosis** — cause (from `runbook.cause.id`), cause
+   score bar (0–5 with the 0.5 `MIN_DIAGNOSE_SCORE` marker,
+   reading `runbook.cause.score`), affected subsystems
+   chips (`runbook.cause.affected_subsystems`), expected
+   channels chips (`runbook.cause.expected_channels`),
+   pipeline-stage timestamps for "when this happened"
+   (`runbook.pipeline.stage_2_diagnose.at_unix`, etc.).
+4. **Procedure** — procedure (humanized, from
+   `runbook.candidates_ranked[0].procedure`), description
+   (from `runbook.candidates_ranked[0].description`),
+   parameters table (key-value with units, from
+   `runbook.candidates_ranked[0].procedure_params` on the
+   corresponding WS `twin_verdict` payload — the runbook
+   stores the procedure name + rank, the params travel on
+   the verdict block), risk score gauge (0–1 with the 0.3
+   `RISK_THRESHOLD_INCONCLUSIVE` marker, from
+   `runbook.candidates_ranked[0].risk_score`), risk class
+   pill (color-coded by
+   `runbook.candidates_ranked[0].risk_class`), approval
+   required pill (color-coded by
+   `runbook.candidates_ranked[0].approval_required`).
 5. **Twin prediction** — linked small multiples
-   trajectory canvas: 3 canvases stacked vertically,
-   all sharing the x-axis (0–60 min, 31 points). Fields:
+   trajectory canvas: 3 canvases stacked vertically, all
+   sharing the x-axis (0–60 min, 31 points). Fields:
    `battery_soc`, `battery_temp_c`, `payload_temp_c`.
    Each canvas shows predicted (solid) and baseline
    (dashed) series, with constraint lines drawn as
    horizontal threshold lines. An injection band drawn
-   as a translucent vertical band at t=0.
+   as a translucent vertical band at t=0. The arrays come
+   from `runbook.trajectory[field].baseline[]` and
+   `runbook.trajectory[field].predicted[]`, or
+   `GET /api/runbooks/{id}/trajectory` if the page prefers
+   a separate fetch.
 6. **Why this procedure** — candidates ranked table
-   (validation-based ranking per D-12). Each row:
-   procedure | risk_score | highlighted if it's the
-   winner.
+   (multi-axis lexicographic ranking per D-19). Each row:
+   rank | procedure | risk_score | effort_score |
+   mission_impact | reversibility | highlighted if it's
+   the winner. Above the table, the **"why this won" panel**
+   surfaces `runbook.winner.factors.reason` (the human-
+   readable explanation of the deciding axis) and
+   `runbook.winner.factors.rank_key_comparison[]` (the
+   4-axis per-axis comparison with the `deciding: true`
+   marker). Below the table, the **"considered vs
+   simulated" panel** renders
+   `runbook.candidates_considered_detail[]` with the
+   `simulated: true|false` flag and `drop_reason` for
+   pre-filtered procedures — the operator sees the full
+   set the cause mapped to, not just the simulated subset.
 7. **Evidence** — symptom window list
-   (`proposal.symptom_window` rendered as
+   (`runbook.symptom_window` rendered as
    `t | channel | subsystem | kind | score` rows) and
    constraint violations table (only populated for
    REJECT verdicts; renders a red-bordered table with
-   the field name and the timestep it broke).
+   the field name and the timestep it broke — comes from
+   the verdict's `per_step_outcomes[]`).
 8. **Approval** — Approve / Reject buttons (Milestone 2
    stub: the buttons are visible, tappable, colored by
-   risk class; on click they show a toast: "Approval
-   deferred to Phase 2 (OPA/Rego). Verdict recorded.").
-   This is intentional: the UI rehearses the Phase 2
-   surface today so the operator's mental model carries
-   forward unmodified.
-9. **Footer metadata** — fault_id (e.g. "F-001"),
-   timestamp, runbook_id stub ("(Phase 3)"). The
-   `twin_simulation_digest` and `proposal_id` fields
-   are empty strings in Phase 1; the footer reserves
-   the slot.
+   the required role from
+   `runbook.candidates_ranked[0].approval_required`; on
+   click they show a toast: "Approval deferred to Phase 2
+   (OPA/Rego). Verdict recorded."). The `runbook.approval`
+   block carries `status: PENDING` until Phase 2 wires the
+   real gate. This is intentional: the UI rehearses the
+   Phase 2 surface today so the operator's mental model
+   carries forward unmodified.
+9. **Footer metadata** — fault_id (e.g. "F-001") from
+   `runbook.fault_id`, generated-at timestamp from
+   `runbook.footer.generated_at_unix`, runbook_id from
+   `runbook.runbook_id` (now a real `RB-YYYYMMDD-NNNN` id
+   from the store, not the Phase 3 stub), twin digest
+   placeholder. The `twin_simulation_digest` and
+   `proposal_id` fields in the verdict are empty strings in
+   Phase 1; the footer reserves the slot.
 
 #### The terminal log (the operator's narrative surface)
 
@@ -2797,6 +3000,120 @@ Likely resolution: add a `RankedCandidate.summary` field
 with a coarse one-line outcome (e.g., "SoC ends at 0.42,
 no violations") and have the WS broadcast that instead
 of the full `validation` block.
+
+### D-19. Propose ranks by multi-axis lexicographic key, not by risk_score
+
+> **Status (added 2026-09-05):** this decision is **new**,
+> driven by the BIBLE §3.2 / §8 / §9 runbook design: the
+> catalog-level editorial fields (`effort_score`,
+> `mission_impact`, `reversibility`) that the operator sees
+> in the runbook are *the same logic* that picked the
+> winner, not just descriptive labels. The pre-2026-09-05
+> `propose()` ranked by `risk_score` alone; the catalog
+> fields were surfaced but not consulted.
+
+**Decision:** `propose()` ranks `candidates_ranked` by the
+**multi-axis lexicographic key**
+`(mission_impact_score, effort_score, reversibility_score,
+risk_score)` ascending. Lower is better. The catalog
+fields are the primary decision axis; runtime
+`risk_score` is the final tie-breaker, only consulted when
+two procedures are tied on impact / effort / reversibility.
+
+The numeric score tables are the same as the pre-D-19
+`_coarse_rank_key` (the pre-filter that kept the top-K
+before the expensive twin sims ran); the runtime sort
+adds `risk_score` as the 4th element so the winner is
+determined by the catalog fields *and* the runtime risk
+in a single comparison. The numeric mappings are:
+
+```python
+_MISSION_IMPACT_SCORE = {"none": 0.0, "minor": 0.2,
+                         "major": 0.5, "mission-ending": 1.0}
+_REVERSIBILITY_SCORE  = {"trivial": 0.0, "easy": 0.1,
+                         "hard": 0.4}
+# effort_score is already in [0, 1] from the registry.
+```
+
+**Why multi-axis and not weighted-sum.** Three reasons:
+
+1. **Operator auditability.** The runbook shows the
+   per-axis comparison (`winner.factors.rank_key_comparison`)
+   with a `deciding: true` marker on the axis that
+   picked the winner. A weighted sum is opaque — the
+   operator would have to compute it from a published
+   weights table to reproduce the choice. Lexicographic
+   ordering has a single tie-break rule ("the first axis
+   that differs decides") and the deciding axis is
+   visible in the runbook.
+
+2. **Defensive against silent regressions.** If a future
+   code change accidentally inverts a catalog field's
+   numeric score (e.g. swaps `trivial` ↔ `hard` in the
+   mapping), the lexicographic structure means the
+   regression is visible — the winner's deciding axis
+   flips immediately, and the test
+   `test_propose_ranks_by_multi_axis_key` (which patches
+   `validate_procedure` to force specific risk_scores)
+   catches it. A weighted sum with a 0.5 risk / 0.5
+   catalog split could mask the regression for several
+   test cases.
+
+3. **Matches D-12's "future evolution" line.** D-12 said:
+   *"the validation-based ranking is the final arbiter,
+   but the catalog fields are surfaced so a future
+   policy engine can weight them."* D-19 is the moment
+   we let the catalog fields *be* the policy — but with
+   the lexicographic structure (not a sum) so the
+   weighting is auditable, not buried in a coefficient
+   table.
+
+**Why not a learned ranker / LLM ranker.** D-12 already
+argued this for the "validation vs. catalog" question:
+the runtime `risk_score` is a deterministic twin-computed
+value, and any ranker that doesn't use it would be making
+worse decisions. Multi-axis lexicographic is a
+deterministic policy on top of the existing
+risk_score; it doesn't replace D-12, it extends it.
+
+**Alternatives considered and rejected:**
+
+- **Weighted sum** (e.g. `0.5*risk + 0.2*effort +
+  0.2*mission_impact + 0.1*reversibility`). Rejected for
+  reason 1 above (opaque) and reason 2 (silently masks
+  catalog regressions).
+- **Pareto-front** (find the set of non-dominated
+  candidates, ask the operator to pick). Rejected: the
+  operator already approved D-19's lex-key via the BIBLE;
+  adding a manual-pick step to the Phase 1 demo loop
+  breaks the "show me everything in one screen" promise
+  of `slight_shift_demo.py`.
+- **Reverse order: risk first, catalog as tie-breaker**
+  (the pre-D-19 behavior extended with a tie-breaker).
+  Rejected: makes `risk_score` the primary axis and
+  catalog fields the secondary, which inverts the
+  operator's auditability story (the runbook would have
+  to explain "we ignored the catalog because risk was
+  close enough", which is much harder to defend than
+  "the catalog decided").
+
+**Migration path for any external consumer.** The
+ordering of `candidates_ranked` and the choice of
+`procedure` may differ for any cause where the catalog
+fields and `risk_score` disagree. The change is *not*
+order-preserving on the previous `risk_score`-only sort.
+For Phase 1 there are no external consumers; the change
+is the same-shape extension as D-18 (additive fields on
+`Proposal`, plus a new `winner_rank_key` field).
+
+**Future evolution:** the `_rank_key` tuple is a
+4-tuple today. If the BIBLE §7 policy engine adds a 5th
+axis (e.g. operator's pre-set "preferred class" for
+recurring faults), the tuple grows and the lexicographic
+ordering naturally extends. The numeric score tables
+would move from `twin/propose.py` constants to a
+`PolicyConfig` dataclass (Phase 2) so the values are
+auditable from the runbook.
 
 ---
 
